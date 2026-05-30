@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nomi.ai conversation archiver.
+NomiVault — Nomi.ai conversation archiver.
 Exports all chat history to self-contained HTML files.
 
 Usage:
@@ -60,9 +60,9 @@ ENDPOINT_CANDIDATES = [
 # the iOS / Android home screen and open without browser chrome.
 _PWA_MANIFEST = """\
 {
-  "name": "Nomi.ai Archive",
-  "short_name": "Nomi Archive",
-  "description": "Archived Nomi.ai conversations",
+  "name": "NomiVault",
+  "short_name": "NomiVault",
+  "description": "NomiVault — Nomi.ai conversation archive",
   "start_url": "index.html",
   "scope": ".",
   "display": "standalone",
@@ -993,7 +993,7 @@ def render_mind_map_html(nomi: dict, mind_map: dict[str, list],
   <main>
 {body}
   </main>
-  <footer>Archived from Nomi.ai &middot; {export_date}</footer>
+  <footer>NomiVault &middot; Nomi.ai &middot; {export_date}</footer>
   <script>
     document.querySelectorAll('[data-utc]').forEach(function(el) {{
       var d = new Date(el.getAttribute('data-utc'));
@@ -1218,7 +1218,7 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
     <img id="lb-img" src="" alt="">
     <video id="lb-video" controls></video>
   </div>
-  <footer>Archived from Nomi.ai &middot; {export_date}</footer>
+  <footer>NomiVault &middot; Nomi.ai &middot; {export_date}</footer>
   <script>
     function scrollToBottom() {{
       document.documentElement.scrollTop = document.documentElement.scrollHeight;
@@ -1327,11 +1327,11 @@ def render_landing_html(entries: list[dict]) -> str:
   <link rel="apple-touch-icon" href="favicon.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Nomi.ai Archive">
+  <meta name="apple-mobile-web-app-title" content="NomiVault">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#16213e">
   <link rel="manifest" href="manifest.json">
-  <title>Nomi.ai Archive</title>
+  <title>NomiVault</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -1401,7 +1401,7 @@ def render_landing_html(entries: list[dict]) -> str:
 </head>
 <body>
   <header>
-    <h1>Nomi.ai Archive</h1>
+    <h1>NomiVault</h1>
     <p>{count} Nomi{"s" if count != 1 else ""} archived &middot; Updated {export_date}</p>
   </header>
   <main>
@@ -1409,7 +1409,7 @@ def render_landing_html(entries: list[dict]) -> str:
 {grid}
     </div>
   </main>
-  <footer>Archived from Nomi.ai &middot; {export_date}</footer>
+  <footer>NomiVault &middot; Nomi.ai &middot; {export_date}</footer>
   <script>
     document.querySelectorAll('[data-utc]').forEach(function(el) {{
       var d = new Date(el.getAttribute('data-utc'));
@@ -1738,7 +1738,7 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
     <button id="lb-close" onclick="closeLb()">&times;</button>
     <img id="lb-img" src="" alt="">
   </div>
-  <footer>Archived from Nomi.ai &middot; Last updated {export_date}</footer>
+  <footer>NomiVault &middot; Nomi.ai &middot; Last updated {export_date}</footer>
   <script>
     function scrollToBottom() {{
       document.documentElement.scrollTop = document.documentElement.scrollHeight;
@@ -2142,7 +2142,7 @@ def _run(args) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Archive Nomi.ai conversations to self-contained HTML files."
+        description="NomiVault — export Nomi.ai conversations to self-contained HTML files."
     )
     parser.add_argument(
         "--key", required=True,
