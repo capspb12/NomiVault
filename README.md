@@ -1,4 +1,4 @@
-# nomi-archive
+# NomiVault
 
 A Python script that exports your [Nomi.ai](https://nomi.ai) conversation history to self-contained HTML files — one chat transcript per Nomi, plus an optional mind map page and media gallery. No external dependencies beyond the Python standard library (one optional package for richer mind map rendering).
 
@@ -94,7 +94,7 @@ The script stores this in its cache after the first successful run, so you only 
 ### Basic — text messages only
 
 ```bash
-python3 nomiarchive.py --key YOUR_API_KEY
+python3 nomivault.py --key YOUR_API_KEY
 ```
 
 Downloads text chat history for every Nomi on your account. Voice transcripts, mind map, and media gallery are not included.
@@ -102,7 +102,7 @@ Downloads text chat history for every Nomi on your account. Voice transcripts, m
 ### Full — messages, voice transcripts, mind map, and media gallery
 
 ```bash
-python3 nomiarchive.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --nomi-id 1234567890
+python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --nomi-id 1234567890
 ```
 
 On every subsequent run the `--nomi-id` argument can be omitted because the ID is saved in the cache.
@@ -110,7 +110,7 @@ On every subsequent run the `--nomi-id` argument can be omitted because the ID i
 ### Incremental update (after first run)
 
 ```bash
-python3 nomiarchive.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN
+python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN
 ```
 
 Only new messages and voice calls since the last run are downloaded. Existing history is merged from the local cache.
@@ -118,7 +118,7 @@ Only new messages and voice calls since the last run are downloaded. Existing hi
 ### Re-download everything from scratch
 
 ```bash
-python3 nomiarchive.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --full
+python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --full
 ```
 
 Ignores the local cache and fetches the entire history again.
@@ -126,7 +126,7 @@ Ignores the local cache and fetches the entire history again.
 ### Save to a custom directory
 
 ```bash
-python3 nomiarchive.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --output ~/Documents/nomi
+python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --output ~/Documents/nomi
 ```
 
 The directory is created automatically if it does not exist.
@@ -140,11 +140,11 @@ The directory is created automatically if it does not exist.
 | `--key KEY` | Yes | Your Nomi.ai API key (Profile → Integration) |
 | `--token TOKEN` | No* | `__Secure-next-auth.session-token` cookie value from beta.nomi.ai. Required for voice transcripts, mind map, and media gallery. |
 | `--nomi-id ID` | No* | Numeric Nomi ID from the beta.nomi.ai URL (e.g. `1234567890`). Required on the first `--token` run per Nomi; cached afterwards. |
-| `--output DIR` | No | Directory to write all output files. Defaults to an `output/` folder next to `nomiarchive.py`. |
+| `--output DIR` | No | Directory to write all output files. Defaults to an `output/` folder next to `nomivault.py`. |
 | `--full` | No | Ignore the local cache and re-download the entire conversation history. |
 | `--messages-url PATTERN` | No | Override the message endpoint pattern for the public API (no-token mode only), e.g. `"/v1/nomis/{uuid}/chats"`. |
 | `--silent` | No | Suppress all terminal output. Run output is still captured and included in the error email if SMTP is configured. |
-| `--smtp-config FILE` | No | Path to an INI file with SMTP settings for error-notification emails. Defaults to `smtp.ini` next to `nomiarchive.py` when that file exists. |
+| `--smtp-config FILE` | No | Path to an INI file with SMTP settings for error-notification emails. Defaults to `smtp.ini` next to `nomivault.py` when that file exists. |
 
 ---
 
@@ -184,7 +184,7 @@ Running the script regularly adds new messages without re-downloading old ones. 
 
 ```bash
 # Add to a scheduled task or run manually whenever you want an update
-python3 /path/to/nomiarchive.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN
+python3 /path/to/nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN
 ```
 
 ---
@@ -195,7 +195,7 @@ The script is designed to run unattended. If anything goes wrong it exits with a
 
 ### 1. Set up email notifications (optional)
 
-Copy `smtp.ini.example` to `smtp.ini` (in the same folder as `nomiarchive.py`) and fill in your SMTP credentials:
+Copy `smtp.ini.example` to `smtp.ini` (in the same folder as `nomivault.py`) and fill in your SMTP credentials:
 
 ```bash
 cp smtp.ini.example smtp.ini
@@ -211,7 +211,7 @@ nano smtp.ini   # or open in any text editor
 Pass `--silent` to suppress all terminal output. The run output is still captured internally and included in any error email:
 
 ```bash
-python3 nomiarchive.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --silent
+python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --silent
 ```
 
 ### 3. Schedule the run
@@ -220,14 +220,14 @@ python3 nomiarchive.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --silent
 
 ```cron
 # Run every day at 3 AM
-0 3 * * * /usr/bin/python3 /path/to/nomiarchive.py --key YOUR_KEY --token YOUR_TOKEN --silent
+0 3 * * * /usr/bin/python3 /path/to/nomivault.py --key YOUR_KEY --token YOUR_TOKEN --silent
 ```
 
 **Windows Task Scheduler** — create a basic task that runs:
 
 ```
 Program:   python.exe
-Arguments: C:\path\to\nomiarchive.py --key YOUR_KEY --token YOUR_TOKEN --silent
+Arguments: C:\path\to\nomivault.py --key YOUR_KEY --token YOUR_TOKEN --silent
 ```
 
 ### What happens on failure
@@ -256,7 +256,7 @@ These require `--token`. Make sure the session token is current and that `--nomi
 If the script detects that the API cursor is not advancing it stops automatically to avoid an infinite loop. Run with `--full` to force a complete re-download.
 
 ### `BETA_AV` version errors
-Nomi.ai occasionally updates their internal API version string. If you see unexpected 400 errors on the beta API, open DevTools on beta.nomi.ai, look at any network request to `beta.nomi.ai/api/...`, and find the `av=` query parameter. Update the `BETA_AV` constant near the top of `nomiarchive.py` to match.
+Nomi.ai occasionally updates their internal API version string. If you see unexpected 400 errors on the beta API, open DevTools on beta.nomi.ai, look at any network request to `beta.nomi.ai/api/...`, and find the `av=` query parameter. Update the `BETA_AV` constant near the top of `nomivault.py` to match.
 
 ---
 

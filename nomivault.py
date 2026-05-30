@@ -4,8 +4,8 @@ Nomi.ai conversation archiver.
 Exports all chat history to self-contained HTML files.
 
 Usage:
-  python3 nomiarchive.py --key YOUR_API_KEY
-  python3 nomiarchive.py --key YOUR_API_KEY --messages-url "/v1/nomis/{uuid}/your-endpoint"
+  python3 nomivault.py --key YOUR_API_KEY
+  python3 nomivault.py --key YOUR_API_KEY --messages-url "/v1/nomis/{uuid}/your-endpoint"
 
 The script auto-discovers the message history endpoint by probing common patterns.
 If auto-discovery fails, follow the DevTools step in the README to find the URL,
@@ -1902,7 +1902,7 @@ def _run(args) -> None:
             if nomi_id == uuid and not args.nomi_id:
                 print(f"  ⚠  Skipping {name} — numeric nomi ID not yet cached.")
                 print(f"     To archive this Nomi, run the script once with:")
-                print(f"       python3 nomiarchive.py --key KEY --token TOKEN --nomi-id XXXXXXX")
+                print(f"       python3 nomivault.py --key KEY --token TOKEN --nomi-id XXXXXXX")
                 print(f"     where XXXXXXX is the number in the URL when viewing this")
                 print(f"     Nomi on beta.nomi.ai:  beta.nomi.ai/nomis/XXXXXXX")
                 print()
@@ -2127,7 +2127,7 @@ def _run(args) -> None:
         if not icon_path.exists():
             icon_path.write_text(_PWA_ICON_SVG, encoding="utf-8")
 
-        # Copy favicon.png from next to nomiarchive.py into the output directory
+        # Copy favicon.png from next to nomivault.py into the output directory
         # if the user has placed one there.  Only copies once; a custom icon
         # already in the output directory is never overwritten.
         src_favicon = Path(__file__).parent / "favicon.png"
@@ -2178,7 +2178,7 @@ def main() -> int:
         "--output",
         metavar="DIR",
         help="Directory to write HTML and cache files to "
-             "(default: 'output' folder next to nomiarchive.py). "
+             "(default: 'output' folder next to nomivault.py). "
              "Created automatically if it does not exist.",
     )
     parser.add_argument(
@@ -2191,7 +2191,7 @@ def main() -> int:
         metavar="FILE",
         help=(
             "Path to an INI file with SMTP settings for error-notification emails. "
-            "When omitted, the script looks for smtp.ini next to nomiarchive.py. "
+            "When omitted, the script looks for smtp.ini next to nomivault.py. "
             "No email is sent if no config file is found. "
             "See smtp.ini.example for the expected format."
         ),
