@@ -4,6 +4,12 @@ A Python script that exports your [Nomi.ai](https://nomi.ai) conversation histor
 
 ---
 
+## Donation
+
+Find this script useful?  Consider making a donation through PayPal at [toddkarwoski.com/buymeacoffee](https://www.toddkarwoski.com/buymeacoffee)
+
+---
+
 ## Screenshots
 
 ![nomi-archive preview](screenshots/preview.gif)
