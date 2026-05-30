@@ -1,0 +1,26 @@
+# SMTP configuration for nomi-archive error notifications
+#
+# Copy this file to smtp.ini (next to archive.py) and fill in your details.
+# smtp.ini is excluded from git — your credentials will never be committed.
+#
+# The script automatically uses smtp.ini when it exists.  You can also point
+# to a different file with:  python3 archive.py --smtp-config /path/to/file.ini
+#
+# An email is sent only when the run exits with an error.  The full run output
+# is included in the message body to help with debugging.
+
+[smtp]
+
+# Outgoing mail server
+host     = smtp.gmail.com
+port     = 587
+
+# Login credentials for the sending account
+user     = youraddress@gmail.com
+password = your-app-password
+
+# The From address in the email (defaults to 'user' if omitted)
+from     = youraddress@gmail.com
+
+# Where to send the error notification
+to       = youraddress@gmail.com

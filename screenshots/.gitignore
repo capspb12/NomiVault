@@ -1,0 +1,4 @@
+# Exclude generated dummy HTML and support files — only PNGs are committed
+*.html
+*.json
+*.svg

@@ -1,0 +1,23 @@
+# Personal archive output — conversation data, HTML exports, JSON cache
+output/
+index.html
+
+# SMTP credentials — never commit
+smtp.ini
+
+# Personal favicon (copy smtp.ini.example → favicon.png workflow)
+favicon.png
+
+# Developer / screenshot-generation utilities
+_gen_screenshots.py
+_capture_screenshots.py
+*.zip
+*.webp
+*.bak/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
