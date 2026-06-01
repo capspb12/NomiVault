@@ -86,6 +86,19 @@ _PWA_MANIFEST = """\
 }
 """
 
+# Minimal service worker — registers so browsers treat the site as an
+# installable PWA (required by Chrome/Android for standalone mode).
+# No caching: always fetches fresh from the server, which is correct for a
+# frequently-updated local archive.
+_SW_JS = """\
+// NomiVault service worker
+// Pass-through only — satisfies the PWA installability requirement without
+// caching anything, so the archive always reflects the latest run.
+self.addEventListener('fetch', function(event) {
+  event.respondWith(fetch(event.request));
+});
+"""
+
 # Simple SVG app icon — dark background with the "N" brand letter.
 _PWA_ICON_SVG = """\
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
@@ -1411,6 +1424,9 @@ def render_landing_html(entries: list[dict]) -> str:
   </main>
   <footer>NomiVault &middot; Nomi.ai &middot; {export_date}</footer>
   <script>
+    if ('serviceWorker' in navigator) {{
+      navigator.serviceWorker.register('sw.js');
+    }}
     document.querySelectorAll('[data-utc]').forEach(function(el) {{
       var d = new Date(el.getAttribute('data-utc'));
       if (!isNaN(d.getTime())) {{
@@ -2123,6 +2139,7 @@ def _run(args) -> None:
         print(f"Landing page → {landing_path}")
 
         (OUTPUT_DIR / "manifest.json").write_text(_PWA_MANIFEST, encoding="utf-8")
+        (OUTPUT_DIR / "sw.js").write_text(_SW_JS, encoding="utf-8")
         icon_path = OUTPUT_DIR / "nomi-icon.svg"
         if not icon_path.exists():
             icon_path.write_text(_PWA_ICON_SVG, encoding="utf-8")
