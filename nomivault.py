@@ -12,6 +12,8 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
+__version__ = "1.2.0"
+
 import argparse
 import configparser
 import io
@@ -2247,6 +2249,9 @@ def _run(args) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="NomiVault — export Nomi.ai conversations to self-contained HTML files."
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"NomiVault {__version__}",
     )
     parser.add_argument(
         "--key", required=True,
