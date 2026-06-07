@@ -550,7 +550,13 @@ def fetch_full_mind_map(nomi_id, token: str,
 # ---------------------------------------------------------------------------
 
 def fetch_selfies(nomi_id, token: str) -> list:
-    """Return metadata for every non-hidden, completed selfie (all pages)."""
+    """Return metadata for every non-hidden, completed media item (all pages).
+
+    Accepts any ``mediaType`` the API returns so that future or lesser-known
+    types (e.g. image transformations) are not silently dropped.  The download
+    loop in ``_run()`` handles known types explicitly and falls back to the
+    selfie-image URL for anything else.
+    """
     all_selfies: list = []
     page = 1
     while True:
@@ -562,9 +568,10 @@ def fetch_selfies(nomi_id, token: str) -> list:
             break
         batch = [
             m for m in data.get("medias", [])
-            if m.get("mediaType") in ("Selfie", "VideoRequest", "CharacterImage")
-            and not m.get("hidden")
-            # CharacterImage has no "completed" field — it's always available
+            if not m.get("hidden")
+            # CharacterImage has no "completed" field — always include it.
+            # For every other type, require "completed" so in-progress
+            # generations are not included.
             and (m.get("completed") or m.get("mediaType") == "CharacterImage")
         ]
         all_selfies.extend(batch)
@@ -583,7 +590,8 @@ def _selfie_filename(selfie: dict, safe_name: str) -> str:
         ts = dt.strftime("%Y-%m-%d_%H-%M-%S")
     except Exception:
         ts = "unknown"
-    return f"{safe_name}_{ts}_{selfie['id'][:8]}.webp"
+    uid = str(selfie.get("id", "unknown"))
+    return f"{safe_name}_{ts}_{uid[:8]}.webp"
 
 
 def _video_filename(video: dict, safe_name: str) -> tuple[str, str]:
@@ -689,10 +697,15 @@ def download_selfie_image(selfie: dict, selfies_dir: Path, token: str,
     """Download a single selfie .webp to *selfies_dir* using a descriptive filename.
 
     Returns the filename string on success (new download or already present),
-    or None if the download failed.
+    or None if the download failed or the download URL could not be determined.
     """
-    img_id   = selfie["id"]
-    req_id   = selfie["selfieRequestId"]
+    img_id   = str(selfie.get("id", ""))
+    req_id   = selfie.get("selfieRequestId")
+    if not req_id:
+        mt = selfie.get("mediaType", "unknown")
+        print(f"    ⚠  Skipping {mt} (id={img_id[:8] if img_id else '?'}) "
+              f"— no selfieRequestId; download URL unknown for this media type.")
+        return None
     filename = _selfie_filename(selfie, safe_name)
     dest     = selfies_dir / filename
     if dest.exists():
@@ -715,6 +728,54 @@ def download_selfie_image(selfie: dict, selfies_dir: Path, token: str,
         return filename
     except Exception as exc:
         print(f"    ⚠  Could not download selfie {img_id[:8]}…: {exc}")
+        return None
+
+
+def _image_edit_filename(item: dict, safe_name: str) -> str:
+    """Return a descriptive filename for an ImageEditRequest: <NomiName>_edit_<date>_<uuid8>.webp"""
+    completed = item.get("completed", "")
+    try:
+        dt = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+        ts = dt.strftime("%Y-%m-%d_%H-%M-%S")
+    except Exception:
+        ts = "unknown"
+    uid = str(item.get("uuid") or item.get("id") or "unknown")
+    return f"{safe_name}_edit_{ts}_{uid[:8]}.webp"
+
+
+def download_image_edit(item: dict, selfies_dir: Path, token: str,
+                        safe_name: str) -> str | None:
+    """Download an ImageEditRequest .webp to *selfies_dir*.
+
+    The result image is always served at:
+      image-edit-requests/{uuid}/edited-image.webp
+    Returns the filename on success or None on failure.
+    """
+    req_uuid = item.get("uuid")
+    if not req_uuid:
+        print(f"    ⚠  Skipping ImageEditRequest — missing uuid")
+        return None
+
+    filename = _image_edit_filename(item, safe_name)
+    dest     = selfies_dir / filename
+    if dest.exists():
+        return filename
+
+    url = f"https://beta.nomi.ai/api/image-edit-requests/{req_uuid}/edited-image.webp"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Cookie":  f"__Secure-next-auth.session-token={token}",
+            "Referer": "https://beta.nomi.ai/",
+            "Accept":  "image/webp,image/*",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            dest.write_bytes(resp.read())
+        return filename
+    except Exception as exc:
+        print(f"    ⚠  Could not download image edit {req_uuid[:8]}: {exc}")
         return None
 
 
@@ -1067,6 +1128,16 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
                 f'  <div class="gal-info">{type_tag}</div>'
                 f'</div>'
             )
+        elif media_type == "ImageEditRequest":
+            filename  = item.get("local_filename") or _image_edit_filename(item, safe_name)
+            img_src   = f"media/{safe_name}/{filename}"
+            type_tag  = '<span class="gal-type gal-type-edit">Edited</span>'
+            cards.append(
+                f'<div class="gal-card" data-src="{img_src}" onclick="openLb(this)">'
+                f'  <img src="{img_src}" alt="Edited image" loading="lazy">'
+                f'  <div class="gal-info">{type_tag}{ts_elem}</div>'
+                f'</div>'
+            )
         else:
             filename = item.get("local_filename") or _selfie_filename(item, safe_name)
             img_src  = f"media/{safe_name}/{filename}"
@@ -1162,6 +1233,7 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
     .gal-type {{ font-size: 0.7rem; color: #4a9eff; font-weight: 600; }}
     .gal-type-video {{ color: #e9a020; }}
     .gal-type-char  {{ color: #a060e0; }}
+    .gal-type-edit  {{ color: #40c080; }}
     .gal-ts  {{ font-size: 0.68rem; color: #556; }}
     .gal-empty {{ color: #445; font-style: italic; padding: 40px 0; text-align: center; }}
     footer {{ text-align: center; padding: 32px 16px; color: #555; font-size: 0.78rem; }}
@@ -2047,6 +2119,15 @@ def _run(args) -> None:
             all_selfies       = all_selfies + new_selfies
             print(f"{len(fresh_selfies)} total, {len(new_selfies)} new")
 
+            # Report any media types the API returned that we haven't seen before,
+            # so the download URL can be wired up in a future update if needed.
+            _known_media_types = {"Selfie", "VideoRequest", "CharacterImage", "ImageEditRequest"}
+            _seen_types = {s.get("mediaType") for s in fresh_selfies} - {None}
+            _new_types  = _seen_types - _known_media_types
+            if _new_types:
+                print(f"  ℹ  New media type(s) found: {', '.join(sorted(_new_types))}"
+                      f" — will attempt download via selfie URL.")
+
             selfies_dir = OUTPUT_DIR / "media" / safe_name
             selfies_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2072,6 +2153,12 @@ def _run(args) -> None:
                     if "local_filename" not in s or not (selfies_dir / s["local_filename"]).exists():
                         fn = download_character_image(s, selfies_dir, args.token,
                                                       safe_name, cached_num_id)
+                        if fn:
+                            s["local_filename"] = fn
+                            newly_dl += 1
+                elif s.get("mediaType") == "ImageEditRequest":
+                    if "local_filename" not in s or not (selfies_dir / s["local_filename"]).exists():
+                        fn = download_image_edit(s, selfies_dir, args.token, safe_name)
                         if fn:
                             s["local_filename"] = fn
                             newly_dl += 1
