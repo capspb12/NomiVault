@@ -33,10 +33,11 @@ Find this script useful?  Consider making a donation through PayPal at [toddkarw
 - **Full chat transcript** — every message, paginated from the beginning of history
 - **Voice call transcripts** — inline in the chat, visually distinct from text messages
 - **Mind map archive** — Lore, Topics, and Goals sections with dossier details rendered from markdown
-- **Media gallery** — selfies, character images, and videos all in one page
+- **Media gallery** — selfies, character images, and videos all in one page with a tabbed layout separating Nomi's media from your uploads
   - Selfies and character images downloaded as `.webp` files with a click-to-enlarge lightbox
   - Videos downloaded as `.mp4` with a preview thumbnail and play button; clicking autoplays in a lightbox
   - Videos are excluded from the chat transcript and appear only in the media gallery
+- **User-uploaded media** — images and videos you send to your Nomi are downloaded and displayed inline in the chat transcript; video thumbnails are shown with a play-button overlay
 - **Incremental updates** — re-running the script only downloads new messages, calls, and media; existing history is preserved in a JSON cache
 - **Local timestamps** — all message times are converted to your browser's local timezone automatically
 - **Cross-page navigation** — chat, mind map, and media pages all link to each other
@@ -165,8 +166,9 @@ The script writes files to the output directory:
 | `<NomiName>-mind-map.html` | Mind map with Lore, Topics, and Goals sections |
 | `<NomiName>-media.html` | Media gallery with selfies, character images, and videos |
 | `<NomiName>.json` | Cache file used for incremental updates — do not delete |
-| `media/<NomiName>/*.webp` | Downloaded selfie images, character images, and video preview thumbnails |
+| `media/<NomiName>/*.webp` | Downloaded selfie images, character images, video preview thumbnails, and user-uploaded images |
 | `media/<NomiName>/*.mp4` | Downloaded video files |
+| `media/<NomiName>/*_upload_*` | Downloaded user-uploaded files (images and video thumbnails) |
 
 Open any `.html` file directly in Chrome or Edge. No web server is needed.
 

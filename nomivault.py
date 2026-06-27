@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import argparse
 import configparser
@@ -138,6 +138,7 @@ def load_cache(safe_name: str) -> dict:
         "numeric_nomi_id": None,
         "mind_map_terms": [],
         "selfies": [],
+        "user_uploads": [],
     }
     path = _cache_path(safe_name)
     if not path.exists():
@@ -153,8 +154,9 @@ def save_cache(safe_name: str, nomi: dict, messages: list,
                transcripts: dict | None = None,
                numeric_nomi_id: int | None = None,
                mind_map_terms: list | None = None,
-               selfies: list | None = None) -> None:
-    """Persist messages, voice-call data, mind-map terms, and selfie metadata."""
+               selfies: list | None = None,
+               user_uploads: list | None = None) -> None:
+    """Persist messages, voice-call data, mind-map terms, selfie metadata, and user uploads."""
     path = _cache_path(safe_name)
     payload = {
         "uuid": nomi["uuid"],
@@ -166,6 +168,7 @@ def save_cache(safe_name: str, nomi: dict, messages: list,
         "transcripts": transcripts or {},
         "mind_map_terms": mind_map_terms or [],
         "selfies": selfies or [],
+        "user_uploads": user_uploads or [],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -781,6 +784,92 @@ def download_image_edit(item: dict, selfies_dir: Path, token: str,
         return None
 
 
+_MIME_TO_EXT: dict = {
+    "image/jpeg":  ".jpg",
+    "image/jpg":   ".jpg",
+    "image/png":   ".png",
+    "image/webp":  ".webp",
+    "image/gif":   ".gif",
+    "image/heic":  ".heic",
+    "image/heif":  ".heif",
+}
+
+
+def _upload_filename(msg: dict, safe_name: str, suffix: str = "") -> str:
+    """Return a local filename for a user-uploaded attachment.
+
+    For images the original filename (and thus its extension) is preserved.
+    For video thumbnails pass suffix='.thumb.webp'; the stem of the original
+    filename is used with that suffix instead.
+    """
+    att      = msg.get("attachment") or {}
+    original = Path(att.get("fileName") or "upload").name
+    sent     = msg.get("sent", "")
+    try:
+        dt = datetime.fromisoformat(sent.replace("Z", "+00:00"))
+        ts = dt.strftime("%Y-%m-%d_%H-%M-%S")
+    except Exception:
+        ts = "unknown"
+    uid = str(msg.get("uuid", ""))[:8]
+    if suffix:
+        stem = Path(original).stem
+        return f"{safe_name}_upload_{ts}_{uid}_{stem}{suffix}"
+    return f"{safe_name}_upload_{ts}_{uid}_{original}"
+
+
+def download_user_upload(msg: dict, media_dir: Path, token: str,
+                         safe_name: str, nomi_id=None) -> str | None:
+    """Download a user-uploaded image or video thumbnail from a chat message.
+
+    URL pattern (discovered via DevTools):
+      images : .../nomis/{id}/message-attachments/{sha256}.{ext}
+      videos : .../nomis/{id}/message-attachments/{sha256}.preview.webp
+               (the original video file is not retained by Nomi.ai)
+
+    Returns the local filename on success, or None on failure / reaped file.
+    """
+    att = msg.get("attachment") or {}
+    if att.get("reaped"):
+        return None
+
+    if not nomi_id:
+        print(f"    ⚠  Cannot download upload — nomi_id unknown (re-run with --nomi-id)")
+        return None
+
+    sha  = att.get("sha256HashBase64", "")
+    mime = att.get("mimeType", "")
+    base = f"https://beta.nomi.ai/api/nomis/{nomi_id}/message-attachments/{sha}"
+
+    if mime.startswith("video/"):
+        url      = f"{base}.preview.webp"
+        filename = _upload_filename(msg, safe_name, suffix=".thumb.webp")
+    else:
+        ext      = _MIME_TO_EXT.get(mime) or Path(att.get("fileName", "")).suffix or ".jpg"
+        url      = f"{base}{ext}"
+        filename = _upload_filename(msg, safe_name)
+
+    dest = media_dir / filename
+    if dest.exists():
+        return filename
+
+    headers = {
+        "Cookie":  f"__Secure-next-auth.session-token={token}",
+        "Referer": "https://beta.nomi.ai/",
+        "Accept":  "*/*",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            dest.write_bytes(resp.read())
+        return filename
+    except urllib.error.HTTPError as exc:
+        print(f"    ⚠  Could not download upload {str(msg.get('uuid',''))[:8]}: HTTP {exc.code} ({url})")
+        return None
+    except Exception as exc:
+        print(f"    ⚠  Could not download upload {str(msg.get('uuid',''))[:8]}: {exc}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
@@ -1088,19 +1177,27 @@ def render_mind_map_html(nomi: dict, mind_map: dict[str, list],
 
 def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
                         chat_link: str | None = None,
-                        mind_map_link: str | None = None) -> str:
+                        mind_map_link: str | None = None,
+                        user_uploads: list | None = None) -> str:
     """Render a self-contained photo gallery page for all downloaded selfies."""
-    nomi_name   = nomi["name"]
-    export_date = datetime.now().strftime("%b %d, %Y %I:%M %p")
+    nomi_name    = nomi["name"]
+    export_date  = datetime.now().strftime("%b %d, %Y %I:%M %p")
+    _uploads     = [u for u in (user_uploads or []) if u.get("local_filename")]
 
     # Oldest first
     sorted_selfies = sorted(
         selfies, key=lambda s: s.get("completed", "")
     )
 
+    _GALLERY_TYPES = {"Selfie", "VideoRequest", "CharacterImage", "ImageEditRequest"}
+
     cards: list[str] = []
     for item in sorted_selfies:
-        media_type = item.get("mediaType", "Selfie")
+        media_type = item.get("mediaType") or "Selfie"
+        if media_type not in _GALLERY_TYPES:
+            continue
+        if media_type == "Selfie" and item.get("type") == "Art":
+            continue
         ts_elem    = _ts_html(item.get("completed", ""), "gal-ts")
 
         if media_type == "VideoRequest":
@@ -1152,16 +1249,56 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
                 f'</div>'
             )
 
-    grid = "\n".join(cards) if cards else '<p class="gal-empty">No media downloaded yet.</p>'
+    nomi_grid = "\n".join(cards) if cards else '<p class="gal-empty">No media downloaded yet.</p>'
 
-    photo_count = sum(1 for s in selfies if s.get("mediaType") != "VideoRequest")
-    video_count = sum(1 for s in selfies if s.get("mediaType") == "VideoRequest")
+    # Build the "You" tab — user-uploaded images and videos
+    upload_cards: list[str] = []
+    for u in sorted(_uploads, key=lambda x: x.get("sent", "")):
+        att_src  = f"media/{safe_name}/{u['local_filename']}"
+        ts_elem  = _ts_html(u.get("sent", ""), "gal-ts")
+        if u.get("is_video"):
+            # Only the thumbnail is available; open it in the image lightbox
+            upload_cards.append(
+                f'<div class="gal-card" data-src="{att_src}" onclick="openLb(this)">'
+                f'  <div class="gal-thumb">'
+                f'    <img src="{att_src}" alt="Video thumbnail" loading="lazy">'
+                f'    <div class="play-overlay"><div class="play-btn"></div></div>'
+                f'  </div>'
+                f'  <div class="gal-info">'
+                f'    <span class="gal-type gal-type-video">Video</span>{ts_elem}'
+                f'  </div>'
+                f'</div>'
+            )
+        else:
+            upload_cards.append(
+                f'<div class="gal-card" data-src="{att_src}" onclick="openLb(this)">'
+                f'  <img src="{att_src}" alt="Uploaded image" loading="lazy">'
+                f'  <div class="gal-info">'
+                f'    <span class="gal-type gal-type-upload">Photo</span>{ts_elem}'
+                f'  </div>'
+                f'</div>'
+            )
+    upload_grid = "\n".join(upload_cards) if upload_cards else '<p class="gal-empty">No uploaded media found.</p>'
+
+    photo_count  = sum(1 for s in selfies if s.get("mediaType") != "VideoRequest")
+    video_count  = sum(1 for s in selfies if s.get("mediaType") == "VideoRequest")
+    upload_count = len(_uploads)
     count_parts: list[str] = []
     if photo_count:
         count_parts.append(f'{photo_count} photo{"s" if photo_count != 1 else ""}')
     if video_count:
         count_parts.append(f'{video_count} video{"s" if video_count != 1 else ""}')
     count_str = " &middot; ".join(count_parts) if count_parts else "0 items"
+    if upload_count:
+        count_str += f' &middot; {upload_count} upload{"s" if upload_count != 1 else ""}'
+
+    show_tabs = bool(_uploads)   # only render tab bar when there are user uploads
+    tab_bar_html = (
+        '<div class="tab-bar">'
+        f'<button class="tab-btn active" data-tab="nomi" onclick="switchTab(this,\'nomi\')">{nomi_name}</button>'
+        '<button class="tab-btn" data-tab="yours" onclick="switchTab(this,\'yours\')">You</button>'
+        '</div>'
+    ) if show_tabs else ""
 
     nav = _nav_bar("media", chat_link, mind_map_link, None)
 
@@ -1233,11 +1370,21 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
       align-items: flex-start; gap: 2px;
     }}
     .gal-type {{ font-size: 0.7rem; color: #4a9eff; font-weight: 600; }}
-    .gal-type-video {{ color: #e9a020; }}
-    .gal-type-char  {{ color: #a060e0; }}
-    .gal-type-edit  {{ color: #40c080; }}
+    .gal-type-video  {{ color: #e9a020; }}
+    .gal-type-char   {{ color: #a060e0; }}
+    .gal-type-edit   {{ color: #40c080; }}
+    .gal-type-upload {{ color: #4a9eff; }}
     .gal-ts  {{ font-size: 0.68rem; color: #556; }}
     .gal-empty {{ color: #445; font-style: italic; padding: 40px 0; text-align: center; }}
+    /* Tab bar */
+    .tab-bar {{ display: flex; gap: 4px; padding: 16px 24px 0; }}
+    .tab-btn {{
+      padding: 8px 20px; border-radius: 8px 8px 0 0; border: none; cursor: pointer;
+      font-size: 0.9rem; font-weight: 600; background: #0f3460; color: #8899bb;
+      transition: background 0.15s, color 0.15s;
+    }}
+    .tab-btn.active {{ background: #1a2a5e; color: #e0e8ff; }}
+    .tab-btn:hover {{ background: #1a2a5e; color: #c0ccee; }}
     footer {{ text-align: center; padding: 32px 16px; color: #555; font-size: 0.78rem; }}
     /* Lightbox */
     #lightbox {{
@@ -1290,8 +1437,16 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
     {nav}
   </header>
   <main>
-    <div class="gal-grid">
-{grid}
+    {tab_bar_html}
+    <div id="tab-nomi" class="tab-pane">
+      <div class="gal-grid">
+{nomi_grid}
+      </div>
+    </div>
+    <div id="tab-yours" class="tab-pane" style="display:none">
+      <div class="gal-grid">
+{upload_grid}
+      </div>
     </div>
   </main>
   <button id="btn-top" class="scroll-btn"
@@ -1337,6 +1492,12 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
         vid.pause(); vid.src = ''; vid.style.display = 'none';
         img.style.display = 'block';
       }}
+    }}
+    function switchTab(btn, tabName) {{
+      document.querySelectorAll('.tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+      document.querySelectorAll('.tab-pane').forEach(function(p) {{ p.style.display = 'none'; }});
+      btn.classList.add('active');
+      document.getElementById('tab-' + tabName).style.display = 'block';
     }}
     document.addEventListener('keydown', function(e) {{
       if (e.key === 'Escape') closeLb();
@@ -1566,7 +1727,8 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
                 mind_map_link: str | None = None,
                 selfies_link: str | None = None,
                 selfies: list | None = None,
-                safe_name: str = "") -> str:
+                safe_name: str = "",
+                user_uploads: list | None = None) -> str:
     nomi_name = nomi["name"]
     relationship = nomi.get("relationshipType", "")
     created_raw = (nomi.get("created") or "")
@@ -1580,12 +1742,19 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
     _vc_list   = voice_calls    or []
     seen_calls: set = set()
 
+    # Lookup: message UUID → upload record (for inline attachment rendering)
+    _upload_map: dict = {
+        u["message_uuid"]: u
+        for u in (user_uploads or [])
+        if u.get("local_filename")
+    }
+
     # Build a merged timeline of messages and selfies, sorted by timestamp
     timeline: list[tuple[str, str, dict]] = []
     for msg in messages:
         timeline.append(("msg", _msg_timestamp(msg), msg))
     for s in (selfies or []):
-        if s.get("mediaType", "Selfie") == "Selfie":
+        if s.get("mediaType") == "Selfie" and s.get("type") != "Art":
             timeline.append(("selfie", s.get("completed", ""), s))
     timeline.sort(key=lambda x: x[1])
 
@@ -1644,12 +1813,34 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
         safe_text = _html_escape(text)
         ts_html   = f'<div class="timestamp">{_ts_html(ts_raw)}</div>' if ts_raw else ""
 
+        # Inline attachment (user-uploaded image or video thumbnail)
+        upload      = _upload_map.get(msg.get("uuid", ""))
+        attach_html = ""
+        if upload:
+            att_src = f"media/{safe_name}/{upload['local_filename']}"
+            if upload.get("is_video"):
+                attach_html = (
+                    f'<div class="attach-wrap attach-video-wrap"'
+                    f' data-src="{att_src}" onclick="openLb(this)">'
+                    f'<img class="attach-img" src="{att_src}" alt="Video" loading="lazy">'
+                    f'<div class="play-overlay"><div class="play-btn"></div></div>'
+                    f'<div class="attach-video-label">Video</div>'
+                    f'</div>'
+                )
+            else:
+                attach_html = (
+                    f'<div class="attach-wrap" data-src="{att_src}" onclick="openLb(this)">'
+                    f'<img class="attach-img" src="{att_src}" alt="Uploaded image" loading="lazy">'
+                    f'</div>'
+                )
+
         bubbles.append(
             f'        <div class="message-row {side_cls}">\n'
             f'          <div class="bubble {bubble_cls}">\n'
             f'            <div class="sender-name">{sender_label}</div>\n'
-            f'            <div class="message-text">{safe_text}</div>\n'
-            f'            {ts_html}\n'
+            + (f'            {attach_html}\n' if attach_html else '')
+            + (f'            <div class="message-text">{safe_text}</div>\n' if safe_text else '')
+            + f'            {ts_html}\n'
             f'          </div>\n'
             f'        </div>'
         )
@@ -1767,6 +1958,36 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
     .selfie-inline:hover {{ border-color: #4a9eff; transform: translateY(-2px); }}
     .selfie-inline img {{ width: 100%; display: block; }}
     .selfie-inline .timestamp {{ padding: 4px 8px; font-size: 0.68rem; color: #556; text-align: center; opacity: 1; }}
+    /* ---- user-uploaded attachments ---- */
+    .attach-wrap {{
+      margin-bottom: 6px; border-radius: 8px; overflow: hidden;
+      max-width: 240px; cursor: zoom-in; position: relative;
+      border: 1px solid rgba(255,255,255,0.1);
+    }}
+    .attach-img {{ width: 100%; display: block; }}
+    .attach-video-wrap {{ cursor: zoom-in; }}
+    .play-overlay {{
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      pointer-events: none;
+    }}
+    .play-btn {{
+      width: 52px; height: 52px; border-radius: 50%;
+      background: rgba(0,0,0,0.62); border: 2px solid rgba(255,255,255,0.85);
+      display: flex; align-items: center; justify-content: center;
+    }}
+    .play-btn::after {{
+      content: ''; border-style: solid;
+      border-width: 10px 0 10px 18px;
+      border-color: transparent transparent transparent #fff;
+      margin-left: 4px;
+    }}
+    .attach-video-label {{
+      position: absolute; bottom: 4px; right: 6px;
+      font-size: 0.65rem; font-weight: 700; color: #fff;
+      background: rgba(0,0,0,0.55); padding: 1px 5px; border-radius: 4px;
+      letter-spacing: 0.03em;
+    }}
     /* ---- lightbox ---- */
     #lightbox {{
       display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.92);
@@ -2111,8 +2332,9 @@ def _run(args) -> None:
             mm_path.write_text(mm_html, encoding="utf-8")
             print(f"  Mind map → {mm_path}")
 
-        # --- selfies (token path only) ----------------------------------
-        all_selfies: list = cache.get("selfies", [])
+        # --- selfies and user uploads (token path only) -----------------
+        all_user_uploads: list = cache.get("user_uploads", [])
+        all_selfies: list      = cache.get("selfies", [])
         if using_token:
             print("  Fetching media list ...", end=" ", flush=True)
             fresh_selfies     = fetch_selfies(cached_num_id, args.token)
@@ -2121,14 +2343,13 @@ def _run(args) -> None:
             all_selfies       = all_selfies + new_selfies
             print(f"{len(fresh_selfies)} total, {len(new_selfies)} new")
 
-            # Report any media types the API returned that we haven't seen before,
-            # so the download URL can be wired up in a future update if needed.
-            _known_media_types = {"Selfie", "VideoRequest", "CharacterImage", "ImageEditRequest"}
-            _seen_types = {s.get("mediaType") for s in fresh_selfies} - {None}
-            _new_types  = _seen_types - _known_media_types
+            # Report all unique media types found in the full list (cache + new).
+            _known_media_types = {"Selfie", "VideoRequest", "CharacterImage", "ImageEditRequest", "Art"}
+            _all_types = {s.get("mediaType") for s in all_selfies} - {None}
+            _new_types = _all_types - _known_media_types
             if _new_types:
-                print(f"  ℹ  New media type(s) found: {', '.join(sorted(_new_types))}"
-                      f" — will attempt download via selfie URL.")
+                print(f"  ℹ  Unknown media type(s) found: {', '.join(sorted(_new_types))}"
+                      f" — these will be skipped.")
 
             selfies_dir = OUTPUT_DIR / "media" / safe_name
             selfies_dir.mkdir(parents=True, exist_ok=True)
@@ -2165,6 +2386,8 @@ def _run(args) -> None:
                             s["local_filename"] = fn
                             newly_dl += 1
                 else:
+                    if s.get("type") == "Art":
+                        continue   # Art selfies don't appear in the Nomi.ai chat timeline
                     if "local_filename" not in s or not (selfies_dir / s["local_filename"]).exists():
                         fn = download_selfie_image(s, selfies_dir, args.token, safe_name)
                         if fn:
@@ -2173,9 +2396,32 @@ def _run(args) -> None:
             if newly_dl:
                 print(f"  Downloaded {newly_dl} new media file(s)")
 
+            # --- user uploads (attached images/videos the user sent) ----
+            cached_upload_ids = {u["message_uuid"] for u in all_user_uploads}
+            msgs_with_att = [
+                m for m in merged
+                if m.get("attachment") and not m["attachment"].get("reaped")
+                and m.get("uuid") not in cached_upload_ids
+            ]
+            if msgs_with_att:
+                print(f"  Downloading {len(msgs_with_att)} new user upload(s) ...")
+                for m in msgs_with_att:
+                    fn = download_user_upload(m, selfies_dir, args.token,
+                                              safe_name, nomi_id=cached_num_id)
+                    att = m["attachment"]
+                    all_user_uploads.append({
+                        "message_uuid":   m.get("uuid", ""),
+                        "sent":           m.get("sent", ""),
+                        "mime_type":      att.get("mimeType", ""),
+                        "file_name":      att.get("fileName", ""),
+                        "local_filename": fn,
+                        "is_video":       att.get("mimeType", "").startswith("video/"),
+                    })
+
             gallery_html = render_gallery_html(nomi, all_selfies, safe_name,
                                                chat_link=chat_lnk,
-                                               mind_map_link=mm_lnk)
+                                               mind_map_link=mm_lnk,
+                                               user_uploads=all_user_uploads)
             gallery_path = OUTPUT_DIR / f"{safe_name}-media.html"
             gallery_path.write_text(gallery_html, encoding="utf-8")
             print(f"  Media gallery → {gallery_path}")
@@ -2202,7 +2448,8 @@ def _run(args) -> None:
                    transcripts=all_tx,
                    numeric_nomi_id=cached_num_id,
                    mind_map_terms=all_mm_terms,
-                   selfies=all_selfies)
+                   selfies=all_selfies,
+                   user_uploads=all_user_uploads)
 
         # --- render HTML ------------------------------------------------
         html = render_html(
@@ -2214,6 +2461,7 @@ def _run(args) -> None:
             selfies_link   = selfies_lnk,
             selfies        = all_selfies,
             safe_name      = safe_name,
+            user_uploads   = all_user_uploads,
         )
         out_path = OUTPUT_DIR / f"{safe_name}.html"
         out_path.write_text(html, encoding="utf-8")
