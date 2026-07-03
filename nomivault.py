@@ -18,6 +18,7 @@ import argparse
 import configparser
 import io
 import json
+import re
 import sys
 import time
 import traceback
@@ -881,11 +882,28 @@ def _msg_timestamp(msg: dict) -> str:
     return ""
 
 
+_TZ_SUFFIX_RE = re.compile(r"(Z|[+-]\d{2}:\d{2})$")
+
+
+def _ensure_utc(raw: str) -> str:
+    """Guarantee an ISO timestamp string carries an explicit UTC/offset marker.
+
+    Some API endpoints (e.g. mind map term details) return timestamps without
+    a trailing "Z" or offset. Without one, JavaScript's Date() constructor
+    parses the string as local time instead of UTC, throwing off every
+    downstream "convert to viewer's local time" display by the browser's UTC
+    offset. All Nomi.ai timestamps are UTC, so default to that when missing.
+    """
+    if not raw or _TZ_SUFFIX_RE.search(raw):
+        return raw
+    return raw + "Z"
+
+
 def _format_ts(raw: str) -> str:
     if not raw:
         return ""
     try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(_ensure_utc(raw).replace("Z", "+00:00"))
         return dt.strftime("%b %d, %Y %I:%M %p")
     except Exception:
         return raw
@@ -902,7 +920,7 @@ def _ts_html(raw: str, cls: str = "ts") -> str:
     if not raw:
         return ""
     fallback = _format_ts(raw)
-    return f'<time class="{cls}" data-utc="{raw}">{fallback}</time>'
+    return f'<time class="{cls}" data-utc="{_ensure_utc(raw)}">{fallback}</time>'
 
 
 def _nav_bar(current: str,
@@ -1195,8 +1213,6 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
     for item in sorted_selfies:
         media_type = item.get("mediaType") or "Selfie"
         if media_type not in _GALLERY_TYPES:
-            continue
-        if media_type == "Selfie" and item.get("type") == "Art":
             continue
         ts_elem    = _ts_html(item.get("completed", ""), "gal-ts")
 
@@ -1543,12 +1559,12 @@ def render_landing_html(entries: list[dict]) -> str:
         # "Since …" date label — JS will localise; Python fallback is date-only UTC
         if first_ts:
             try:
-                dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(_ensure_utc(first_ts).replace("Z", "+00:00"))
                 fallback_date = dt.strftime("%b %d, %Y")
             except Exception:
                 fallback_date = first_ts[:10]
             since = (f'<div class="card-date">'
-                     f'<time data-utc="{first_ts}">Since {fallback_date}</time>'
+                     f'<time data-utc="{_ensure_utc(first_ts)}">Since {fallback_date}</time>'
                      f'</div>')
         else:
             since = ""
