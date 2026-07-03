@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import argparse
 import configparser
