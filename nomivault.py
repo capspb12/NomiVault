@@ -2386,8 +2386,6 @@ def _run(args) -> None:
                             s["local_filename"] = fn
                             newly_dl += 1
                 else:
-                    if s.get("type") == "Art":
-                        continue   # Art selfies don't appear in the Nomi.ai chat timeline
                     if "local_filename" not in s or not (selfies_dir / s["local_filename"]).exists():
                         fn = download_selfie_image(s, selfies_dir, args.token, safe_name)
                         if fn:
