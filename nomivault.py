@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 import argparse
 import configparser
@@ -356,6 +356,26 @@ def beta_api_get(path: str, token: str, extra: dict | None = None):
         raise RuntimeError(f"HTTP {exc.code} for {BETA_BASE}{path}: {body}") from exc
 
 
+def fetch_beta_nomi_pictures(token: str) -> dict:
+    """Return a mapping of Nomi UUID -> pictureImageId.
+
+    The public /v1/nomis endpoint (used without --token) doesn't include
+    this field; only the beta.nomi.ai internal Nomi list does. Returns an
+    empty dict on any failure (missing/expired token, unexpected shape).
+    """
+    data = beta_api_get("/nomis", token)
+    if not data or data == "AUTH_FAILED":
+        return {}
+    nomis = data.get("nomis", data) if isinstance(data, dict) else data
+    if not isinstance(nomis, list):
+        return {}
+    return {
+        n["uuid"]: n["pictureImageId"]
+        for n in nomis
+        if n.get("uuid") and n.get("pictureImageId")
+    }
+
+
 def fetch_beta_messages(nomi_id, token: str,
                         known_ids: set | None = None) -> tuple[list, list, int | None]:
     """Fetch new chat messages by paginating backwards through history.
@@ -695,6 +715,39 @@ def download_character_image(img: dict, selfies_dir: Path, token: str,
         return filename
     except Exception as exc:
         print(f"    ⚠  Could not download character image {img_id[:8]}…: {exc}")
+        return None
+
+
+def download_profile_picture(picture_image_id: str, selfies_dir: Path, token: str,
+                              safe_name: str, nomi_id) -> str | None:
+    """Download the Nomi's currently-selected profile picture.
+
+    Uses the ``pictureImageId`` field from the beta.nomi.ai internal Nomi
+    list (see ``fetch_beta_nomi_pictures``) and the same image endpoint as
+    CharacterImage downloads. The filename is keyed by image ID, so if the
+    user changes their picture, a new file is downloaded on the next run
+    instead of silently reusing a stale cached one. Returns the filename on
+    success (or if already downloaded), or None on failure.
+    """
+    filename = f"{safe_name}_profile_{picture_image_id[:16]}.webp"
+    dest     = selfies_dir / filename
+    if dest.exists():
+        return filename
+    url = f"https://beta.nomi.ai/api/nomis/{nomi_id}/images/{picture_image_id}.webp"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Cookie":  f"__Secure-next-auth.session-token={token}",
+            "Referer": "https://beta.nomi.ai/",
+            "Accept":  "image/webp,image/*",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            dest.write_bytes(resp.read())
+        return filename
+    except Exception as exc:
+        print(f"    ⚠  Could not download profile picture: {exc}")
         return None
 
 
@@ -2204,6 +2257,11 @@ def _run(args) -> None:
     else:
         print("Tip: pass --token to also archive voice-call transcripts.\n")
 
+    # Profile pictures aren't in the public /v1/nomis response; only the
+    # beta.nomi.ai internal Nomi list has pictureImageId. Fetch it once here
+    # rather than per-Nomi.
+    nomi_pictures: dict = fetch_beta_nomi_pictures(args.token) if args.token else {}
+
     confirmed_pattern: str | None = None   # used only in no-token mode
     landing_entries:   list[dict] = []
 
@@ -2375,6 +2433,7 @@ def _run(args) -> None:
         # --- selfies and user uploads (token path only) -----------------
         all_user_uploads: list = cache.get("user_uploads", [])
         all_selfies: list      = cache.get("selfies", [])
+        profile_pic_filename: str | None = None
         if using_token:
             print("  Fetching media list ...", end=" ", flush=True)
             fresh_selfies     = fetch_selfies(cached_num_id, args.token)
@@ -2393,6 +2452,15 @@ def _run(args) -> None:
 
             selfies_dir = OUTPUT_DIR / "media" / safe_name
             selfies_dir.mkdir(parents=True, exist_ok=True)
+
+            # --- profile picture (currently selected on the Nomi's own record) ---
+            picture_image_id = nomi_pictures.get(uuid)
+            if picture_image_id:
+                print("  Downloading profile picture ...", end=" ", flush=True)
+                profile_pic_filename = download_profile_picture(
+                    picture_image_id, selfies_dir, args.token, safe_name, cached_num_id
+                )
+                print("done" if profile_pic_filename else "failed")
 
             # Download new media and ensure all have local filenames stored
             newly_dl = 0
@@ -2465,13 +2533,19 @@ def _run(args) -> None:
             print(f"  Media gallery → {gallery_path}")
 
         # --- collect landing page entry ---------------------------------
-        char_imgs = [s for s in all_selfies
-                     if s.get("mediaType") == "CharacterImage"
-                     and s.get("local_filename")]
-        char_img_src = (
-            f"media/{safe_name}/{char_imgs[0]['local_filename']}"
-            if char_imgs else None
-        )
+        # Prefer the Nomi's actual currently-selected profile picture; fall
+        # back to the first generated CharacterImage if it's unavailable
+        # (e.g. running without --token, or the picture couldn't be fetched).
+        if profile_pic_filename:
+            char_img_src = f"media/{safe_name}/{profile_pic_filename}"
+        else:
+            char_imgs = [s for s in all_selfies
+                         if s.get("mediaType") == "CharacterImage"
+                         and s.get("local_filename")]
+            char_img_src = (
+                f"media/{safe_name}/{char_imgs[0]['local_filename']}"
+                if char_imgs else None
+            )
         first_msg_ts = min((_msg_timestamp(m) for m in merged), default="") if merged else ""
         landing_entries.append({
             "name":           name,

@@ -41,7 +41,7 @@ Find this script useful?  Consider making a donation through PayPal at [toddkarw
 - **Incremental updates** — re-running the script only downloads new messages, calls, and media; existing history is preserved in a JSON cache
 - **Local timestamps** — all message times are converted to your browser's local timezone automatically
 - **Cross-page navigation** — chat, mind map, and media pages all link to each other
-- **Landing page** — `index.html` shows all archived Nomis as cards with their character image as background, sorted by first chat date
+- **Landing page** — `index.html` shows all archived Nomis as cards, sorted by first chat date, using each Nomi's actual currently-selected profile picture as the card background
 - **No external server needed** — HTML files open directly in any browser
 
 ---
@@ -171,6 +171,7 @@ The script writes files to the output directory:
 | `media/<NomiName>/*.webp` | Downloaded selfie images, character images, video preview thumbnails, and user-uploaded images |
 | `media/<NomiName>/*.mp4` | Downloaded video files |
 | `media/<NomiName>/*_upload_*` | Downloaded user-uploaded files (images and video thumbnails) |
+| `media/<NomiName>/*_profile_*.webp` | The Nomi's currently-selected profile picture, used as the landing page card background |
 
 Open any `.html` file directly in Chrome or Edge. No web server is needed.
 
