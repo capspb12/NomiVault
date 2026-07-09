@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 import argparse
 import configparser
@@ -2207,6 +2207,29 @@ def _run(args) -> None:
     confirmed_pattern: str | None = None   # used only in no-token mode
     landing_entries:   list[dict] = []
 
+    # --nomi-id is a single global CLI value, but it must only ever apply to
+    # the one Nomi it was meant for. If it were applied to *any* Nomi that
+    # lacks a cached numeric ID, and more than one Nomi happens to be in
+    # that state during the same run (e.g. an older Nomi archived without
+    # --token before, or a --full re-run), it would silently leak onto the
+    # wrong Nomi and both would end up fetching the same conversation.
+    # Only auto-apply it when exactly one Nomi in this run is missing one.
+    nomi_id_target_uuid: str | None = None
+    if args.token and args.nomi_id:
+        uncached_uuids = [
+            n["uuid"] for n in nomis
+            if not (({} if args.full else load_cache(_safe_name(n["name"])))
+                    .get("numeric_nomi_id"))
+        ]
+        if len(uncached_uuids) == 1:
+            nomi_id_target_uuid = uncached_uuids[0]
+        elif len(uncached_uuids) > 1:
+            print(f"⚠  --nomi-id was provided, but {len(uncached_uuids)} Nomis are "
+                  f"missing a cached numeric ID, so it's ambiguous which one it's for.")
+            print("   Ignoring --nomi-id this run — archive Nomis one at a time:")
+            print("   run with --nomi-id set to just one Nomi's ID, let it finish,")
+            print("   then repeat for the next.\n")
+
     for nomi in nomis:
         name      = nomi["name"]
         uuid      = nomi["uuid"]
@@ -2225,8 +2248,9 @@ def _run(args) -> None:
         # Path A: beta.nomi.ai  (messages + voice calls in one response)
         # ================================================================
         if args.token:
-            nomi_id = cached_num_id or args.nomi_id or uuid
-            if nomi_id == uuid and not args.nomi_id:
+            this_nomi_id_arg = args.nomi_id if uuid == nomi_id_target_uuid else None
+            nomi_id = cached_num_id or this_nomi_id_arg or uuid
+            if nomi_id == uuid and not this_nomi_id_arg:
                 print(f"  ⚠  Skipping {name} — numeric nomi ID not yet cached.")
                 print(f"     To archive this Nomi, run the script once with:")
                 print(f"       python3 nomivault.py --key KEY --token TOKEN --nomi-id XXXXXXX")
@@ -2543,7 +2567,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--full", action="store_true",
-        help="Ignore the local cache and re-download the entire conversation history.",
+        help="Ignore the local cache and re-download the entire conversation history "
+             "for EVERY Nomi processed this run, not just one. A brand-new Nomi does "
+             "not need this — it is downloaded in full automatically since it has no "
+             "cache yet. To force a clean re-download of a single already-archived "
+             "Nomi, delete that Nomi's <Name>.json cache file instead of using --full.",
     )
     parser.add_argument(
         "--output",

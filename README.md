@@ -94,6 +94,8 @@ The script stores this in its cache after the first successful run, so you only 
 
 **Multiple Nomis:** If you have more than one Nomi, run the script once per Nomi on the first run, each time passing that Nomi's `--nomi-id`. After that, all Nomis are handled automatically in a single run.
 
+> **Do not add `--full`** when archiving a new Nomi — a Nomi with no existing cache is downloaded in full automatically. `--full` resets the cache for *every* Nomi processed that run, not just the new one, which can strip an already-archived Nomi of its cached numeric ID and cause its data to get mixed up with another Nomi's. If you need to force a clean re-download of one already-archived Nomi, delete that Nomi's `<Name>.json` cache file instead of passing `--full`.
+
 ---
 
 ## Usage
@@ -128,7 +130,7 @@ Only new messages and voice calls since the last run are downloaded. Existing hi
 python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --full
 ```
 
-Ignores the local cache and fetches the entire history again.
+Ignores the local cache and fetches the entire history again — for **every** Nomi processed this run, not just one. To force a clean re-download of a single already-archived Nomi instead, delete that Nomi's `<Name>.json` cache file and run normally without `--full`.
 
 ### Save to a custom directory
 
@@ -148,7 +150,7 @@ The directory is created automatically if it does not exist.
 | `--token TOKEN` | No* | `__Secure-next-auth.session-token` cookie value from beta.nomi.ai. Required for voice transcripts, mind map, and media gallery. |
 | `--nomi-id ID` | No* | Numeric Nomi ID from the beta.nomi.ai URL (e.g. `1234567890`). Required on the first `--token` run per Nomi; cached afterwards. |
 | `--output DIR` | No | Directory to write all output files. Defaults to an `output/` folder next to `nomivault.py`. |
-| `--full` | No | Ignore the local cache and re-download the entire conversation history. |
+| `--full` | No | Ignore the local cache and re-download the entire conversation history for every Nomi processed this run (not just one). Not needed for a new Nomi's first run — that happens automatically. To force a clean re-download of a single Nomi, delete its `<Name>.json` cache file instead. |
 | `--messages-url PATTERN` | No | Override the message endpoint pattern for the public API (no-token mode only), e.g. `"/v1/nomis/{uuid}/chats"`. |
 | `--silent` | No | Suppress all terminal output. Run output is still captured and included in the error email if SMTP is configured. |
 | `--smtp-config FILE` | No | Path to an INI file with SMTP settings for error-notification emails. Defaults to `smtp.ini` next to `nomivault.py` when that file exists. |
