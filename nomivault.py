@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import argparse
 import configparser
@@ -122,11 +122,96 @@ def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip()
 
 
-def _cache_path(safe_name: str) -> Path:
-    return OUTPUT_DIR / f"{safe_name}.json"
+def _nomi_folder_name(safe_name: str, numeric_id) -> str:
+    """Return this Nomi's output folder name.
+
+    Suffixed with its numeric ID (once known) to guarantee uniqueness even
+    if two Nomis share a display name. Before the ID is known (no --token
+    yet, or the very first run before beta discovery/--nomi-id resolves
+    it), falls back to a bare placeholder folder named after the Nomi;
+    ``_resolve_nomi_dir`` renames it once the ID becomes known.
+    """
+    return f"{safe_name}-{numeric_id}" if numeric_id else safe_name
 
 
-def load_cache(safe_name: str) -> dict:
+def _resolve_nomi_dir(safe_name: str, numeric_id) -> Path:
+    """Return this Nomi's output folder, migrating older layouts if needed.
+
+    Two migrations happen automatically, both one-time and idempotent:
+      1. A placeholder folder (created before the numeric ID was known) is
+         renamed to the ID-suffixed name as soon as the ID becomes known.
+      2. Pre-1.5 flat output (root-level <Name>.html/.json/-mind-map.html/
+         -media.html and a shared media/<Name>/ folder) is moved into this
+         Nomi's own folder.
+    """
+    target      = OUTPUT_DIR / _nomi_folder_name(safe_name, numeric_id)
+    placeholder = OUTPUT_DIR / safe_name
+
+    if numeric_id and placeholder != target and placeholder.exists() and not target.exists():
+        placeholder.rename(target)
+
+    if not target.exists():
+        # (old_path, new filename) — the chat page is renamed to the
+        # <Name>-chat.html convention (matching -mind-map.html/-media.html)
+        # as part of this migration; everything else keeps its name.
+        old_renames = [
+            (OUTPUT_DIR / f"{safe_name}.html",          f"{safe_name}-chat.html"),
+            (OUTPUT_DIR / f"{safe_name}.json",          f"{safe_name}.json"),
+            (OUTPUT_DIR / f"{safe_name}-mind-map.html", f"{safe_name}-mind-map.html"),
+            (OUTPUT_DIR / f"{safe_name}-media.html",    f"{safe_name}-media.html"),
+        ]
+        old_media = OUTPUT_DIR / "media" / safe_name
+        if any(p.exists() for p, _ in old_renames) or old_media.exists():
+            target.mkdir(parents=True, exist_ok=True)
+            for old_path, new_name in old_renames:
+                if old_path.exists():
+                    old_path.rename(target / new_name)
+            if old_media.exists():
+                old_media.rename(target / "media")
+
+    return target
+
+
+def _patch_legacy_html_links(html_text: str, safe_name: str) -> str:
+    """Fix cross-page/asset references baked into HTML rendered by an older
+    layout, for a Nomi whose page is never re-rendered again (e.g. one
+    that's been deleted on Nomi.ai, so the main loop no longer visits it).
+    Active Nomis don't need this — their pages are freshly re-rendered
+    every run, which already produces correct links.
+
+    Safe to apply repeatedly: every replacement is a no-op if the text is
+    already up to date.
+    """
+    html_text = html_text.replace('href="index.html"', 'href="../index.html"')
+    html_text = html_text.replace('href="favicon.png"', 'href="../favicon.png"')
+    html_text = html_text.replace(f"media/{safe_name}/", "media/")
+    html_text = html_text.replace(f'href="{safe_name}.html"', f'href="{safe_name}-chat.html"')
+    return html_text
+
+
+def _peek_cached_numeric_id(safe_name: str, known_numeric_id) -> int | None:
+    """Read numeric_nomi_id from wherever this Nomi's cache currently lives,
+    without migrating or renaming anything. Used only to decide whether
+    --nomi-id is ambiguous before the main loop starts.
+    """
+    for candidate in (
+        OUTPUT_DIR / _nomi_folder_name(safe_name, known_numeric_id) / f"{safe_name}.json",
+        OUTPUT_DIR / safe_name / f"{safe_name}.json",
+        OUTPUT_DIR / f"{safe_name}.json",
+    ):
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8")).get("numeric_nomi_id")
+            except Exception:
+                pass
+    return None
+
+
+def _cache_path(nomi_dir: Path, safe_name: str) -> Path:
+    return nomi_dir / f"{safe_name}.json"
+
+
+def load_cache(nomi_dir: Path, safe_name: str) -> dict:
     """Load the full cache record from the JSON sidecar.
 
     Returns a dict with keys: messages, voice_calls, transcripts, numeric_nomi_id.
@@ -141,7 +226,7 @@ def load_cache(safe_name: str) -> dict:
         "selfies": [],
         "user_uploads": [],
     }
-    path = _cache_path(safe_name)
+    path = _cache_path(nomi_dir, safe_name)
     if not path.exists():
         return empty
     try:
@@ -150,7 +235,7 @@ def load_cache(safe_name: str) -> dict:
         return empty
 
 
-def save_cache(safe_name: str, nomi: dict, messages: list,
+def save_cache(nomi_dir: Path, safe_name: str, nomi: dict, messages: list,
                voice_calls: list | None = None,
                transcripts: dict | None = None,
                numeric_nomi_id: int | None = None,
@@ -158,7 +243,7 @@ def save_cache(safe_name: str, nomi: dict, messages: list,
                selfies: list | None = None,
                user_uploads: list | None = None) -> None:
     """Persist messages, voice-call data, mind-map terms, selfie metadata, and user uploads."""
-    path = _cache_path(safe_name)
+    path = _cache_path(nomi_dir, safe_name)
     payload = {
         "uuid": nomi["uuid"],
         "name": nomi["name"],
@@ -356,12 +441,17 @@ def beta_api_get(path: str, token: str, extra: dict | None = None):
         raise RuntimeError(f"HTTP {exc.code} for {BETA_BASE}{path}: {body}") from exc
 
 
-def fetch_beta_nomi_pictures(token: str) -> dict:
-    """Return a mapping of Nomi UUID -> pictureImageId.
+def fetch_beta_nomi_info(token: str) -> dict:
+    """Return per-Nomi info from the beta.nomi.ai internal Nomi list, keyed by UUID.
 
-    The public /v1/nomis endpoint (used without --token) doesn't include
-    this field; only the beta.nomi.ai internal Nomi list does. Returns an
-    empty dict on any failure (missing/expired token, unexpected shape).
+    The public /v1/nomis endpoint (used without --token) only returns
+    name/uuid; the beta endpoint additionally exposes each Nomi's numeric
+    ID ("id" — needed for every other beta.nomi.ai call) and its
+    currently-selected profile picture ("pictureImageId"). This lets the
+    numeric ID be auto-discovered on a Nomi's very first --token run,
+    without the user needing to look it up in the browser URL and pass
+    --nomi-id manually. Returns an empty dict on any failure (missing/
+    expired token, unexpected response shape).
     """
     data = beta_api_get("/nomis", token)
     if not data or data == "AUTH_FAILED":
@@ -370,9 +460,12 @@ def fetch_beta_nomi_pictures(token: str) -> dict:
     if not isinstance(nomis, list):
         return {}
     return {
-        n["uuid"]: n["pictureImageId"]
+        n["uuid"]: {
+            "numeric_id":     n.get("id"),
+            "pictureImageId": n.get("pictureImageId"),
+        }
         for n in nomis
-        if n.get("uuid") and n.get("pictureImageId")
+        if n.get("uuid")
     }
 
 
@@ -723,7 +816,7 @@ def download_profile_picture(picture_image_id: str, selfies_dir: Path, token: st
     """Download the Nomi's currently-selected profile picture.
 
     Uses the ``pictureImageId`` field from the beta.nomi.ai internal Nomi
-    list (see ``fetch_beta_nomi_pictures``) and the same image endpoint as
+    list (see ``fetch_beta_nomi_info``) and the same image endpoint as
     CharacterImage downloads. The filename is keyed by image ID, so if the
     user changes their picture, a new file is downloaded on the next run
     instead of silently reusing a stale cached one. Returns the filename on
@@ -993,7 +1086,7 @@ def _nav_bar(current: str,
         return f'<a href="{href}" class="nav-btn">{label}</a>'
 
     parts = [
-        f'<a href="index.html" class="nav-btn">&#8962; Home</a>',
+        f'<a href="../index.html" class="nav-btn">&#8962; Home</a>',
         btn("Chat",     chat_link,     "chat"),
         btn("Mind Map", mind_map_link, "mindmap"),
         btn("Media",    selfies_link,  "media"),
@@ -1126,8 +1219,8 @@ def render_mind_map_html(nomi: dict, mind_map: dict[str, list],
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" type="image/png" href="favicon.png">
-  <link rel="apple-touch-icon" href="favicon.png">
+  <link rel="icon" type="image/png" href="../favicon.png">
+  <link rel="apple-touch-icon" href="../favicon.png">
   <title>{nomi_name} &mdash; Mind Map</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -1272,8 +1365,8 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
         if media_type == "VideoRequest":
             preview_fn = item.get("preview_filename") or _video_filename(item, safe_name)[0]
             video_fn   = item.get("video_filename")   or _video_filename(item, safe_name)[1]
-            img_src    = f"media/{safe_name}/{preview_fn}"
-            video_src  = f"media/{safe_name}/{video_fn}"
+            img_src    = f"media/{preview_fn}"
+            video_src  = f"media/{video_fn}"
             cards.append(
                 f'<div class="gal-card" data-type="video" data-src="{img_src}"'
                 f' data-video-src="{video_src}" onclick="openLb(this)">'
@@ -1288,7 +1381,7 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
             )
         elif media_type == "CharacterImage":
             filename  = item.get("local_filename") or _character_image_filename(item, safe_name)
-            img_src   = f"media/{safe_name}/{filename}"
+            img_src   = f"media/{filename}"
             type_tag  = '<span class="gal-type gal-type-char">Character Image</span>'
             cards.append(
                 f'<div class="gal-card" data-src="{img_src}" onclick="openLb(this)">'
@@ -1298,7 +1391,7 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
             )
         elif media_type == "ImageEditRequest":
             filename  = item.get("local_filename") or _image_edit_filename(item, safe_name)
-            img_src   = f"media/{safe_name}/{filename}"
+            img_src   = f"media/{filename}"
             type_tag  = '<span class="gal-type gal-type-edit">Edited</span>'
             cards.append(
                 f'<div class="gal-card" data-src="{img_src}" onclick="openLb(this)">'
@@ -1308,7 +1401,7 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
             )
         else:
             filename = item.get("local_filename") or _selfie_filename(item, safe_name)
-            img_src  = f"media/{safe_name}/{filename}"
+            img_src  = f"media/{filename}"
             s_type   = _html_escape(item.get("type") or "")
             type_tag = f'<span class="gal-type">{s_type}</span>' if s_type else ""
             cards.append(
@@ -1323,7 +1416,7 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
     # Build the "You" tab — user-uploaded images and videos
     upload_cards: list[str] = []
     for u in sorted(_uploads, key=lambda x: x.get("sent", "")):
-        att_src  = f"media/{safe_name}/{u['local_filename']}"
+        att_src  = f"media/{u['local_filename']}"
         ts_elem  = _ts_html(u.get("sent", ""), "gal-ts")
         if u.get("is_video"):
             # Only the thumbnail is available; open it in the image lightbox
@@ -1376,8 +1469,8 @@ def render_gallery_html(nomi: dict, selfies: list, safe_name: str,
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" type="image/png" href="favicon.png">
-  <link rel="apple-touch-icon" href="favicon.png">
+  <link rel="icon" type="image/png" href="../favicon.png">
+  <link rel="apple-touch-icon" href="../favicon.png">
   <title>{nomi_name} &mdash; Media</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -1590,7 +1683,12 @@ def render_landing_html(entries: list[dict]) -> str:
     """Render index.html — a card grid linking to each archived Nomi's chat log.
 
     Each entry dict must contain:
-      name, safe_name, first_msg_ts (ISO-8601 str), char_image_src (path or None)
+      name, safe_name, folder_name, first_msg_ts (ISO-8601 str),
+      char_image_src (path or None)
+    An entry may also set ``deleted: True`` for a Nomi that no longer exists
+    on the Nomi.ai account but still has local archive files — its card is
+    shown desaturated with a "Deleted on Nomi.ai" badge, still linking to
+    its existing HTML.
     Entries must already be sorted before calling this function.
     """
     export_date = datetime.now().strftime("%b %d, %Y %I:%M %p")
@@ -1599,9 +1697,10 @@ def render_landing_html(entries: list[dict]) -> str:
     cards: list[str] = []
     for e in entries:
         name     = _html_escape(e["name"])
-        href     = e["safe_name"] + ".html"
+        href     = f"{e.get('folder_name', e['safe_name'])}/{e['safe_name']}-chat.html"
         img_src  = e.get("char_image_src") or ""
         first_ts = e.get("first_msg_ts", "")
+        deleted  = e.get("deleted", False)
 
         if img_src:
             bg_style = (f"background-image:url('{img_src}');"
@@ -1622,10 +1721,14 @@ def render_landing_html(entries: list[dict]) -> str:
         else:
             since = ""
 
+        card_class = "nomi-card is-deleted" if deleted else "nomi-card"
+        badge      = '<div class="card-badge">Deleted on Nomi.ai</div>' if deleted else ""
+
         cards.append(
-            f'<a href="{href}" class="nomi-card">'
+            f'<a href="{href}" class="{card_class}">'
             f'  <div class="card-bg" style="{bg_style}"></div>'
             f'  <div class="card-overlay"></div>'
+            f'  {badge}'
             f'  <div class="card-info">'
             f'    <div class="card-name">{name}</div>'
             f'    {since}'
@@ -1704,6 +1807,14 @@ def render_landing_html(entries: list[dict]) -> str:
     .card-date {{
       font-size: 0.76rem; color: rgba(255,255,255,0.72);
       margin-top: 5px; text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+    }}
+    .nomi-card.is-deleted .card-bg {{ filter: grayscale(1) brightness(0.55); }}
+    .card-badge {{
+      position: absolute; top: 12px; right: 12px;
+      background: rgba(233,69,96,0.9); color: #fff;
+      font-size: 0.68rem; font-weight: 700; letter-spacing: 0.02em;
+      padding: 4px 10px; border-radius: 20px;
+      text-shadow: none;
     }}
     .no-nomis {{ color: #445; font-style: italic; text-align: center; padding: 60px 0; }}
     footer {{ text-align: center; padding: 32px 16px; color: #555; font-size: 0.78rem; }}
@@ -1833,7 +1944,7 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
         if kind == "selfie":
             selfie   = data
             filename = selfie.get("local_filename") or _selfie_filename(selfie, safe_name)
-            img_src  = f"media/{safe_name}/{filename}"
+            img_src  = f"media/{filename}"
             ts_elem  = _ts_html(selfie.get("completed", ""), "timestamp")
             bubbles.append(
                 f'        <div class="message-row selfie-row">\n'
@@ -1886,7 +1997,7 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
         upload      = _upload_map.get(msg.get("uuid", ""))
         attach_html = ""
         if upload:
-            att_src = f"media/{safe_name}/{upload['local_filename']}"
+            att_src = f"media/{upload['local_filename']}"
             if upload.get("is_video"):
                 attach_html = (
                     f'<div class="attach-wrap attach-video-wrap"'
@@ -1930,8 +2041,8 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" type="image/png" href="favicon.png">
-  <link rel="apple-touch-icon" href="favicon.png">
+  <link rel="icon" type="image/png" href="../favicon.png">
+  <link rel="apple-touch-icon" href="../favicon.png">
   <title>{nomi_name} &mdash; Chat</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -2257,33 +2368,38 @@ def _run(args) -> None:
     else:
         print("Tip: pass --token to also archive voice-call transcripts.\n")
 
-    # Profile pictures aren't in the public /v1/nomis response; only the
-    # beta.nomi.ai internal Nomi list has pictureImageId. Fetch it once here
-    # rather than per-Nomi.
-    nomi_pictures: dict = fetch_beta_nomi_pictures(args.token) if args.token else {}
+    # Numeric IDs and profile pictures aren't in the public /v1/nomis
+    # response; only the beta.nomi.ai internal Nomi list has them. Fetch it
+    # once here rather than per-Nomi, so a brand-new Nomi's numeric ID can be
+    # auto-discovered without the user having to look it up in the browser
+    # URL and pass --nomi-id manually.
+    beta_nomi_info: dict = fetch_beta_nomi_info(args.token) if args.token else {}
 
     confirmed_pattern: str | None = None   # used only in no-token mode
     landing_entries:   list[dict] = []
 
-    # --nomi-id is a single global CLI value, but it must only ever apply to
-    # the one Nomi it was meant for. If it were applied to *any* Nomi that
-    # lacks a cached numeric ID, and more than one Nomi happens to be in
-    # that state during the same run (e.g. an older Nomi archived without
-    # --token before, or a --full re-run), it would silently leak onto the
-    # wrong Nomi and both would end up fetching the same conversation.
-    # Only auto-apply it when exactly one Nomi in this run is missing one.
+    # --nomi-id is now only a manual fallback for when auto-discovery above
+    # doesn't have an entry for a Nomi (e.g. the beta API call failed). It's
+    # a single global CLI value, but it must only ever apply to the one Nomi
+    # it was meant for — if it were applied to *any* Nomi still missing a
+    # numeric ID, and more than one happened to be in that state during the
+    # same run, it would silently leak onto the wrong Nomi and both would
+    # end up fetching the same conversation. Only auto-apply it when exactly
+    # one Nomi in this run needs it.
     nomi_id_target_uuid: str | None = None
     if args.token and args.nomi_id:
         uncached_uuids = [
             n["uuid"] for n in nomis
-            if not (({} if args.full else load_cache(_safe_name(n["name"])))
-                    .get("numeric_nomi_id"))
+            if not beta_nomi_info.get(n["uuid"], {}).get("numeric_id")
+            and not (None if args.full else _peek_cached_numeric_id(
+                _safe_name(n["name"]), beta_nomi_info.get(n["uuid"], {}).get("numeric_id")))
         ]
         if len(uncached_uuids) == 1:
             nomi_id_target_uuid = uncached_uuids[0]
         elif len(uncached_uuids) > 1:
             print(f"⚠  --nomi-id was provided, but {len(uncached_uuids)} Nomis are "
-                  f"missing a cached numeric ID, so it's ambiguous which one it's for.")
+                  f"missing a numeric ID (cached or auto-discovered), so it's "
+                  f"ambiguous which one it's for.")
             print("   Ignoring --nomi-id this run — archive Nomis one at a time:")
             print("   run with --nomi-id set to just one Nomi's ID, let it finish,")
             print("   then repeat for the next.\n")
@@ -2294,26 +2410,37 @@ def _run(args) -> None:
         safe_name = _safe_name(name)
         print(f"Processing: {name}  ({uuid})")
 
+        # --- resolve this Nomi's output folder, migrating older layouts --
+        auto_numeric_id = beta_nomi_info.get(uuid, {}).get("numeric_id")
+        nomi_dir = _resolve_nomi_dir(safe_name, auto_numeric_id)
+
         # --- load local cache -------------------------------------------
-        cache            = {} if args.full else load_cache(safe_name)
+        cache            = {} if args.full else load_cache(nomi_dir, safe_name)
         cached_messages  = cache.get("messages",        [])
         cached_vc        = cache.get("voice_calls",     [])
         cached_tx        = cache.get("transcripts",     {})
         cached_num_id    = cache.get("numeric_nomi_id", None)
         is_incremental   = bool(cached_messages)
 
+        # The numeric ID may not have been known ahead of time (no --token
+        # yet, or this run's beta lookup failed) but could already be
+        # cached from an earlier run — rename the placeholder folder now
+        # that we know it.
+        if not auto_numeric_id and cached_num_id:
+            nomi_dir = _resolve_nomi_dir(safe_name, cached_num_id)
+
         # ================================================================
         # Path A: beta.nomi.ai  (messages + voice calls in one response)
         # ================================================================
         if args.token:
             this_nomi_id_arg = args.nomi_id if uuid == nomi_id_target_uuid else None
-            nomi_id = cached_num_id or this_nomi_id_arg or uuid
+            nomi_id = cached_num_id or auto_numeric_id or this_nomi_id_arg or uuid
             if nomi_id == uuid and not this_nomi_id_arg:
-                print(f"  ⚠  Skipping {name} — numeric nomi ID not yet cached.")
-                print(f"     To archive this Nomi, run the script once with:")
-                print(f"       python3 nomivault.py --key KEY --token TOKEN --nomi-id XXXXXXX")
-                print(f"     where XXXXXXX is the number in the URL when viewing this")
-                print(f"     Nomi on beta.nomi.ai:  beta.nomi.ai/nomis/XXXXXXX")
+                print(f"  ⚠  Skipping {name} — numeric nomi ID not yet cached or discoverable.")
+                print(f"     This usually means the beta.nomi.ai lookup failed this run.")
+                print(f"     You can force it by passing --nomi-id XXXXXXX, where XXXXXXX")
+                print(f"     is the number in the URL when viewing this Nomi on beta.nomi.ai:")
+                print(f"     beta.nomi.ai/nomis/XXXXXXX")
                 print()
                 continue
             # Build a set of already-cached message IDs so fetch_beta_messages
@@ -2412,9 +2539,9 @@ def _run(args) -> None:
         if args.token and not using_token:
             print(f"  ⚠  Mind map and media skipped — numeric nomi ID is still unknown.")
             print(f"     Re-run with --nomi-id XXXXXXX (find it in the URL on beta.nomi.ai).")
-        chat_lnk       = f"{safe_name}.html"
-        mm_lnk         = f"{safe_name}-mind-map.html"    if (using_token or (OUTPUT_DIR / f"{safe_name}-mind-map.html").exists())    else None
-        selfies_lnk    = f"{safe_name}-media.html"        if (using_token or (OUTPUT_DIR / f"{safe_name}-media.html").exists())        else None
+        chat_lnk       = f"{safe_name}-chat.html"
+        mm_lnk         = f"{safe_name}-mind-map.html"    if (using_token or (nomi_dir / f"{safe_name}-mind-map.html").exists())    else None
+        selfies_lnk    = f"{safe_name}-media.html"        if (using_token or (nomi_dir / f"{safe_name}-media.html").exists())        else None
 
         # --- mind map (token path only) ---------------------------------
         all_mm_terms: list = cache.get("mind_map_terms", [])
@@ -2426,7 +2553,7 @@ def _run(args) -> None:
             mm_html  = render_mind_map_html(nomi, mm_by_category,
                                              chat_link=chat_lnk,
                                              selfies_link=selfies_lnk)
-            mm_path  = OUTPUT_DIR / f"{safe_name}-mind-map.html"
+            mm_path  = nomi_dir / f"{safe_name}-mind-map.html"
             mm_path.write_text(mm_html, encoding="utf-8")
             print(f"  Mind map → {mm_path}")
 
@@ -2450,11 +2577,11 @@ def _run(args) -> None:
                 print(f"  ℹ  Unknown media type(s) found: {', '.join(sorted(_new_types))}"
                       f" — these will be skipped.")
 
-            selfies_dir = OUTPUT_DIR / "media" / safe_name
+            selfies_dir = nomi_dir / "media"
             selfies_dir.mkdir(parents=True, exist_ok=True)
 
             # --- profile picture (currently selected on the Nomi's own record) ---
-            picture_image_id = nomi_pictures.get(uuid)
+            picture_image_id = beta_nomi_info.get(uuid, {}).get("pictureImageId")
             if picture_image_id:
                 print("  Downloading profile picture ...", end=" ", flush=True)
                 profile_pic_filename = download_profile_picture(
@@ -2528,7 +2655,7 @@ def _run(args) -> None:
                                                chat_link=chat_lnk,
                                                mind_map_link=mm_lnk,
                                                user_uploads=all_user_uploads)
-            gallery_path = OUTPUT_DIR / f"{safe_name}-media.html"
+            gallery_path = nomi_dir / f"{safe_name}-media.html"
             gallery_path.write_text(gallery_html, encoding="utf-8")
             print(f"  Media gallery → {gallery_path}")
 
@@ -2536,26 +2663,30 @@ def _run(args) -> None:
         # Prefer the Nomi's actual currently-selected profile picture; fall
         # back to the first generated CharacterImage if it's unavailable
         # (e.g. running without --token, or the picture couldn't be fetched).
+        # index.html lives one level up from nomi_dir, so paths are prefixed
+        # with this Nomi's folder name.
+        folder_name = nomi_dir.name
         if profile_pic_filename:
-            char_img_src = f"media/{safe_name}/{profile_pic_filename}"
+            char_img_src = f"{folder_name}/media/{profile_pic_filename}"
         else:
             char_imgs = [s for s in all_selfies
                          if s.get("mediaType") == "CharacterImage"
                          and s.get("local_filename")]
             char_img_src = (
-                f"media/{safe_name}/{char_imgs[0]['local_filename']}"
+                f"{folder_name}/media/{char_imgs[0]['local_filename']}"
                 if char_imgs else None
             )
         first_msg_ts = min((_msg_timestamp(m) for m in merged), default="") if merged else ""
         landing_entries.append({
             "name":           name,
             "safe_name":      safe_name,
+            "folder_name":    folder_name,
             "first_msg_ts":   first_msg_ts,
             "char_image_src": char_img_src,
         })
 
         # --- persist cache ----------------------------------------------
-        save_cache(safe_name, nomi, merged,
+        save_cache(nomi_dir, safe_name, nomi, merged,
                    voice_calls=all_vc,
                    transcripts=all_tx,
                    numeric_nomi_id=cached_num_id,
@@ -2575,9 +2706,92 @@ def _run(args) -> None:
             safe_name      = safe_name,
             user_uploads   = all_user_uploads,
         )
-        out_path = OUTPUT_DIR / f"{safe_name}.html"
+        out_path = nomi_dir / f"{safe_name}-chat.html"
         out_path.write_text(html, encoding="utf-8")
         print(f"  Saved → {out_path}\n")
+
+    # --- keep archives of deleted Nomis reachable on the landing page ---
+    # If a Nomi no longer appears in the account (deleted on Nomi.ai), its
+    # local archive files still exist but the main loop above never visits
+    # it, so it would otherwise vanish from index.html even though nothing
+    # was actually removed from disk. Scan for any cache file whose UUID
+    # isn't in this run's active list and re-add it, marked as deleted.
+    active_uuids = {n["uuid"] for n in nomis}
+
+    # Migrate any leftover pre-1.5 flat-root files for a Nomi that's no
+    # longer in the account at all — the main loop's own migration only
+    # runs for Nomis it actually visits (i.e. ones still returned by the
+    # API), so a deleted Nomi's old-layout files would otherwise never move.
+    for cache_file in sorted(OUTPUT_DIR.glob("*.json")):
+        safe_name_o = cache_file.stem
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or not data.get("uuid"):
+            continue   # not a Nomi cache file (e.g. manifest.json)
+        if data.get("uuid") in active_uuids:
+            continue
+        _resolve_nomi_dir(safe_name_o, data.get("numeric_nomi_id"))
+
+    for cache_file in sorted(OUTPUT_DIR.glob("*/*.json")):
+        nomi_dir_o  = cache_file.parent
+        safe_name_o = cache_file.stem
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or not data.get("uuid"):
+            continue
+        if data.get("uuid") in active_uuids:
+            continue
+
+        # This Nomi is never visited by the main loop again, so its pages
+        # are never re-rendered — bring an already-in-folder-but-stale
+        # layout up to date by hand: rename an old-style chat file if one
+        # is still sitting there, then patch every page's baked-in links.
+        chat_path_o = nomi_dir_o / f"{safe_name_o}-chat.html"
+        legacy_chat_path = nomi_dir_o / f"{safe_name_o}.html"
+        if legacy_chat_path.exists() and not chat_path_o.exists():
+            legacy_chat_path.rename(chat_path_o)
+        if not chat_path_o.exists():
+            continue
+
+        for html_path in (
+            chat_path_o,
+            nomi_dir_o / f"{safe_name_o}-mind-map.html",
+            nomi_dir_o / f"{safe_name_o}-media.html",
+        ):
+            if html_path.exists():
+                patched = _patch_legacy_html_links(
+                    html_path.read_text(encoding="utf-8"), safe_name_o
+                )
+                html_path.write_text(patched, encoding="utf-8")
+
+        media_dir_o     = nomi_dir_o / "media"
+        profile_matches = (sorted(media_dir_o.glob(f"{safe_name_o}_profile_*.webp"))
+                           if media_dir_o.exists() else [])
+        if profile_matches:
+            char_img_src_o = f"{nomi_dir_o.name}/media/{profile_matches[0].name}"
+        else:
+            o_char_imgs = [s for s in data.get("selfies", [])
+                           if s.get("mediaType") == "CharacterImage" and s.get("local_filename")]
+            char_img_src_o = (f"{nomi_dir_o.name}/media/{o_char_imgs[0]['local_filename']}"
+                              if o_char_imgs else None)
+
+        o_messages     = data.get("messages", [])
+        first_msg_ts_o = min((_msg_timestamp(m) for m in o_messages), default="") if o_messages else ""
+        display_name   = data.get("name", safe_name_o)
+        landing_entries.append({
+            "name":           display_name,
+            "safe_name":      safe_name_o,
+            "folder_name":    nomi_dir_o.name,
+            "first_msg_ts":   first_msg_ts_o,
+            "char_image_src": char_img_src_o,
+            "deleted":        True,
+        })
+        print(f"Note: {display_name} no longer appears in your Nomi.ai account — "
+              f"kept on the landing page, marked as deleted.")
 
     # --- render landing page + PWA support files -----------------------
     if landing_entries:
@@ -2630,9 +2844,10 @@ def main() -> int:
     parser.add_argument(
         "--nomi-id",
         dest="nomi_id",
-        help="Numeric nomi ID used by beta.nomi.ai (e.g. 1234567890). "
-             "Required on the very first --token run; stored in the cache afterwards. "
-             "Find it in the URL when viewing your Nomi: beta.nomi.ai/nomis/XXXXXXX",
+        help="Numeric nomi ID used by beta.nomi.ai (e.g. 1234567890). Normally "
+             "auto-discovered and cached on the first --token run, so this is only "
+             "needed as a manual fallback if that discovery fails. Find it in the "
+             "URL when viewing your Nomi: beta.nomi.ai/nomis/XXXXXXX",
     )
     parser.add_argument(
         "--messages-url",

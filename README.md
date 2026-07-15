@@ -42,6 +42,8 @@ Find this script useful?  Consider making a donation through PayPal at [toddkarw
 - **Local timestamps** — all message times are converted to your browser's local timezone automatically
 - **Cross-page navigation** — chat, mind map, and media pages all link to each other
 - **Landing page** — `index.html` shows all archived Nomis as cards, sorted by first chat date, using each Nomi's actual currently-selected profile picture as the card background
+- **Per-character folders** — each Nomi's chat, mind map, media pages, cache, and downloaded media live together in their own folder, so nothing gets mixed up between Nomis
+- **Deleted Nomis stay reachable** — if you delete a Nomi from your account, its existing archive isn't dropped from the landing page; it stays there marked "Deleted on Nomi.ai" so you can still browse it
 - **No external server needed** — HTML files open directly in any browser
 
 ---
@@ -84,17 +86,19 @@ The session token unlocks the richer internal API, which is needed for voice cal
 
 > **Note:** Session tokens expire when you sign out. If the script starts returning auth errors, grab a fresh token using the steps above.
 
-### 3. Numeric Nomi ID (required for the first `--token` run per Nomi)
+### 3. Numeric Nomi ID (auto-discovered — you normally don't need this)
 
-1. Open [beta.nomi.ai](https://beta.nomi.ai) and click into any conversation
+The script automatically discovers each Nomi's numeric ID from the beta.nomi.ai API on your first `--token` run — no lookup or extra flag needed, even for a brand-new Nomi.
+
+`--nomi-id` still exists as a manual fallback for the rare case auto-discovery fails (e.g. a network hiccup on that specific call). If the script asks for it:
+
+1. Open [beta.nomi.ai](https://beta.nomi.ai) and click into that Nomi's conversation
 2. Look at the URL — it will look like `beta.nomi.ai/nomis/1234567890`
-3. The number at the end is your Nomi's numeric ID
+3. The number at the end is the numeric ID — pass it as `--nomi-id 1234567890`
 
-The script stores this in its cache after the first successful run, so you only need to provide it once per Nomi.
+**Multiple Nomis:** just run the script normally — every Nomi on your account, new or old, is discovered and archived automatically in a single run.
 
-**Multiple Nomis:** If you have more than one Nomi, run the script once per Nomi on the first run, each time passing that Nomi's `--nomi-id`. After that, all Nomis are handled automatically in a single run.
-
-> **Do not add `--full`** when archiving a new Nomi — a Nomi with no existing cache is downloaded in full automatically. `--full` resets the cache for *every* Nomi processed that run, not just the new one, which can strip an already-archived Nomi of its cached numeric ID and cause its data to get mixed up with another Nomi's. If you need to force a clean re-download of one already-archived Nomi, delete that Nomi's `<Name>.json` cache file instead of passing `--full`.
+> **Do not add `--full`** unless you actually want to force a full re-download. `--full` resets the cache for *every* Nomi processed that run, not just one. If you need to force a clean re-download of one already-archived Nomi, delete that Nomi's `<Name>.json` cache file (inside its own folder — see [Output Files](#output-files)) instead of passing `--full`.
 
 ---
 
@@ -111,10 +115,10 @@ Downloads text chat history for every Nomi on your account. Voice transcripts, m
 ### Full — messages, voice transcripts, mind map, and media gallery
 
 ```bash
-python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --nomi-id 1234567890
+python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN
 ```
 
-On every subsequent run the `--nomi-id` argument can be omitted because the ID is saved in the cache.
+Numeric Nomi IDs are discovered automatically — no `--nomi-id` needed, even for a Nomi you're archiving for the first time. Only pass `--nomi-id 1234567890` manually if the script tells you discovery failed for a specific Nomi.
 
 ### Incremental update (after first run)
 
@@ -130,7 +134,7 @@ Only new messages and voice calls since the last run are downloaded. Existing hi
 python3 nomivault.py --key YOUR_API_KEY --token YOUR_SESSION_TOKEN --full
 ```
 
-Ignores the local cache and fetches the entire history again — for **every** Nomi processed this run, not just one. To force a clean re-download of a single already-archived Nomi instead, delete that Nomi's `<Name>.json` cache file and run normally without `--full`.
+Ignores the local cache and fetches the entire history again — for **every** Nomi processed this run, not just one. To force a clean re-download of a single already-archived Nomi instead, delete that Nomi's `<Name>.json` cache file (inside its own folder) and run normally without `--full`.
 
 ### Save to a custom directory
 
@@ -148,9 +152,9 @@ The directory is created automatically if it does not exist.
 |---|---|---|
 | `--key KEY` | Yes | Your Nomi.ai API key (Profile → Integration) |
 | `--token TOKEN` | No* | `__Secure-next-auth.session-token` cookie value from beta.nomi.ai. Required for voice transcripts, mind map, and media gallery. |
-| `--nomi-id ID` | No* | Numeric Nomi ID from the beta.nomi.ai URL (e.g. `1234567890`). Required on the first `--token` run per Nomi; cached afterwards. |
+| `--nomi-id ID` | No | Numeric Nomi ID from the beta.nomi.ai URL (e.g. `1234567890`). Normally auto-discovered and cached on the first `--token` run; only needed as a manual fallback if that discovery fails for a Nomi. |
 | `--output DIR` | No | Directory to write all output files. Defaults to an `output/` folder next to `nomivault.py`. |
-| `--full` | No | Ignore the local cache and re-download the entire conversation history for every Nomi processed this run (not just one). Not needed for a new Nomi's first run — that happens automatically. To force a clean re-download of a single Nomi, delete its `<Name>.json` cache file instead. |
+| `--full` | No | Ignore the local cache and re-download the entire conversation history for every Nomi processed this run (not just one). Not needed for a new Nomi's first run — that happens automatically. To force a clean re-download of a single Nomi, delete its `<Name>.json` cache file (inside its own folder) instead. |
 | `--messages-url PATTERN` | No | Override the message endpoint pattern for the public API (no-token mode only), e.g. `"/v1/nomis/{uuid}/chats"`. |
 | `--silent` | No | Suppress all terminal output. Run output is still captured and included in the error email if SMTP is configured. |
 | `--smtp-config FILE` | No | Path to an INI file with SMTP settings for error-notification emails. Defaults to `smtp.ini` next to `nomivault.py` when that file exists. |
@@ -159,19 +163,27 @@ The directory is created automatically if it does not exist.
 
 ## Output Files
 
-The script writes files to the output directory:
+Each Nomi gets its own folder, named `<NomiName>-<numericID>` (e.g. `Mila-1185882269/`), so nothing from one Nomi is ever mixed up with another's. A handful of shared files live at the top level alongside those folders:
 
-| File | Description |
-|---|---|
-| `index.html` | Landing page — card grid linking to every archived Nomi |
-| `<NomiName>.html` | Full chat transcript with voice call transcripts inline |
-| `<NomiName>-mind-map.html` | Mind map with Lore, Topics, and Goals sections |
-| `<NomiName>-media.html` | Media gallery with selfies, character images, and videos |
-| `<NomiName>.json` | Cache file used for incremental updates — do not delete |
-| `media/<NomiName>/*.webp` | Downloaded selfie images, character images, video preview thumbnails, and user-uploaded images |
-| `media/<NomiName>/*.mp4` | Downloaded video files |
-| `media/<NomiName>/*_upload_*` | Downloaded user-uploaded files (images and video thumbnails) |
-| `media/<NomiName>/*_profile_*.webp` | The Nomi's currently-selected profile picture, used as the landing page card background |
+```
+output/
+  index.html                          Landing page — cards linking to every archived Nomi
+  manifest.json, sw.js, favicon.png   PWA / home-screen support files
+  <NomiName>-<numericID>/
+    <NomiName>-chat.html              Full chat transcript with voice call transcripts inline
+    <NomiName>-mind-map.html          Mind map with Lore, Topics, and Goals sections
+    <NomiName>-media.html             Media gallery with selfies, character images, and videos
+    <NomiName>.json                   Cache file used for incremental updates — do not delete
+    media/
+      *.webp                         Selfies, character images, video preview thumbnails, user uploads
+      *.mp4                          Downloaded video files
+      *_upload_*                     Downloaded user-uploaded files (images and video thumbnails)
+      *_profile_*.webp               The Nomi's currently-selected profile picture
+```
+
+If you're upgrading from an older version that wrote everything flat into the output directory, the next run automatically moves each Nomi's existing files into its new folder — no manual cleanup needed.
+
+If a Nomi is later deleted from your account, its folder and files stay exactly where they are; it just gets a "Deleted on Nomi.ai" badge on the landing page instead of disappearing.
 
 Open any `.html` file directly in Chrome or Edge. No web server is needed.
 
@@ -255,13 +267,13 @@ Arguments: C:\path\to\nomivault.py --key YOUR_KEY --token YOUR_TOKEN --silent
 Your session token has expired. Grab a fresh one from DevTools (see [Getting Your Credentials](#getting-your-credentials)).
 
 ### HTTP 400 `InvalidRouteParams`
-The numeric Nomi ID is wrong or missing. Check the URL on beta.nomi.ai and pass the correct value with `--nomi-id`.
+The numeric Nomi ID is wrong. This is normally auto-discovered, so this usually means a manually-passed `--nomi-id` doesn't match the Nomi it was meant for — double check the URL on beta.nomi.ai and pass the correct value.
 
-### A Nomi is skipped with "numeric nomi ID not yet cached"
-The script needs the numeric ID on the very first run for each Nomi. Find it in the URL on beta.nomi.ai (`beta.nomi.ai/nomis/XXXXXXX`) and run once with `--nomi-id XXXXXXX`. The ID is cached automatically and subsequent runs need no flag.
+### A Nomi is skipped with "numeric nomi ID not yet cached or discoverable"
+Auto-discovery (via the beta.nomi.ai Nomi list) failed for this Nomi on this run — usually a transient network issue. Just run again; if it keeps happening, find the ID in the URL on beta.nomi.ai (`beta.nomi.ai/nomis/XXXXXXX`) and run once with `--nomi-id XXXXXXX` as a manual override.
 
 ### Mind map, voice transcripts, or media not appearing
-These require `--token`. Make sure the session token is current and that `--nomi-id` was provided on the first run.
+These require `--token`. Make sure the session token is current.
 
 ### Script stops downloading messages early
 If the script detects that the API cursor is not advancing it stops automatically to avoid an infinite loop. Run with `--full` to force a complete re-download.
