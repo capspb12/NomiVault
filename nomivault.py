@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 import argparse
 import configparser
@@ -161,13 +161,12 @@ def _resolve_nomi_dir(safe_name: str, numeric_id) -> Path:
             (OUTPUT_DIR / f"{safe_name}-media.html",    f"{safe_name}-media.html"),
         ]
         old_media = OUTPUT_DIR / "media" / safe_name
-        if any(p.exists() for p, _ in old_renames) or old_media.exists():
-            target.mkdir(parents=True, exist_ok=True)
-            for old_path, new_name in old_renames:
-                if old_path.exists():
-                    old_path.rename(target / new_name)
-            if old_media.exists():
-                old_media.rename(target / "media")
+        target.mkdir(parents=True, exist_ok=True)
+        for old_path, new_name in old_renames:
+            if old_path.exists():
+                old_path.rename(target / new_name)
+        if old_media.exists():
+            old_media.rename(target / "media")
 
     return target
 
@@ -447,11 +446,19 @@ def fetch_beta_nomi_info(token: str) -> dict:
     The public /v1/nomis endpoint (used without --token) only returns
     name/uuid; the beta endpoint additionally exposes each Nomi's numeric
     ID ("id" — needed for every other beta.nomi.ai call) and its
-    currently-selected profile picture ("pictureImageId"). This lets the
-    numeric ID be auto-discovered on a Nomi's very first --token run,
-    without the user needing to look it up in the browser URL and pass
-    --nomi-id manually. Returns an empty dict on any failure (missing/
-    expired token, unexpected response shape).
+    currently-selected profile picture. This lets the numeric ID be
+    auto-discovered on a Nomi's very first --token run, without the user
+    needing to look it up in the browser URL and pass --nomi-id manually.
+
+    The profile picture is tracked in one of two fields depending on
+    whether it's a generated selfie or a character image:
+    "pictureSelfieImageId" (set when the active picture is a selfie) or
+    "pictureImageId" (a character image; also the field populated at
+    Nomi creation). Only one is generally live at a time, so
+    pictureSelfieImageId is preferred when present.
+
+    Returns an empty dict on any failure (missing/expired token,
+    unexpected response shape).
     """
     data = beta_api_get("/nomis", token)
     if not data or data == "AUTH_FAILED":
@@ -461,8 +468,9 @@ def fetch_beta_nomi_info(token: str) -> dict:
         return {}
     return {
         n["uuid"]: {
-            "numeric_id":     n.get("id"),
-            "pictureImageId": n.get("pictureImageId"),
+            "numeric_id":          n.get("id"),
+            "pictureImageId":      n.get("pictureImageId"),
+            "pictureSelfieImageId": n.get("pictureSelfieImageId"),
         }
         for n in nomis
         if n.get("uuid")
@@ -812,36 +820,57 @@ def download_character_image(img: dict, selfies_dir: Path, token: str,
 
 
 def download_profile_picture(picture_image_id: str, selfies_dir: Path, token: str,
-                              safe_name: str, nomi_id) -> str | None:
+                              safe_name: str, nomi_id,
+                              all_selfies: list | None = None) -> tuple[str | None, bool]:
     """Download the Nomi's currently-selected profile picture.
 
-    Uses the ``pictureImageId`` field from the beta.nomi.ai internal Nomi
-    list (see ``fetch_beta_nomi_info``) and the same image endpoint as
-    CharacterImage downloads. The filename is keyed by image ID, so if the
-    user changes their picture, a new file is downloaded on the next run
-    instead of silently reusing a stale cached one. Returns the filename on
-    success (or if already downloaded), or None on failure.
+    *picture_image_id* should be whichever of pictureSelfieImageId /
+    pictureImageId is currently active (see ``fetch_beta_nomi_info``). The
+    filename is keyed by that ID, so a change to it triggers a fresh
+    download instead of reusing a stale cached one.
+
+    Character images are served from the generic per-Nomi image endpoint,
+    but selfies are served from a selfie-request-scoped endpoint instead
+    (see ``download_selfie_image``) — since the ID alone doesn't say which
+    kind it is, the generic endpoint is tried first and, if that fails, we
+    look the ID up in *all_selfies* for a matching selfieRequestId to try
+    the selfie-specific URL as a fallback.
+
+    Returns ``(filename, was_freshly_downloaded)`` — filename is None on
+    failure.
     """
     filename = f"{safe_name}_profile_{picture_image_id[:16]}.webp"
     dest     = selfies_dir / filename
     if dest.exists():
-        return filename
-    url = f"https://beta.nomi.ai/api/nomis/{nomi_id}/images/{picture_image_id}.webp"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Cookie":  f"__Secure-next-auth.session-token={token}",
-            "Referer": "https://beta.nomi.ai/",
-            "Accept":  "image/webp,image/*",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            dest.write_bytes(resp.read())
-        return filename
-    except Exception as exc:
-        print(f"    ⚠  Could not download profile picture: {exc}")
-        return None
+        return filename, False
+
+    headers = {
+        "Cookie":  f"__Secure-next-auth.session-token={token}",
+        "Referer": "https://beta.nomi.ai/",
+        "Accept":  "image/webp,image/*",
+    }
+    urls = [f"https://beta.nomi.ai/api/nomis/{nomi_id}/images/{picture_image_id}.webp"]
+    match = next((s for s in (all_selfies or [])
+                  if str(s.get("id")) == picture_image_id), None)
+    if match and match.get("selfieRequestId"):
+        urls.append(
+            f"https://beta.nomi.ai/api/selfie-requests/{match['selfieRequestId']}"
+            f"/images/{picture_image_id}.webp"
+        )
+
+    last_exc: Exception | None = None
+    for url in urls:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                dest.write_bytes(resp.read())
+            return filename, True
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    print(f"    ⚠  Could not download profile picture: {last_exc}")
+    return None, False
 
 
 def download_selfie_image(selfie: dict, selfies_dir: Path, token: str,
@@ -1822,8 +1851,12 @@ def render_landing_html(entries: list[dict]) -> str:
       header {{ padding: 16px 18px; }}
       header h1 {{ font-size: 1.3rem; }}
       main {{ padding: 18px 12px 60px; }}
-      .nomi-grid {{ grid-template-columns: 1fr; gap: 14px; }}
+      .nomi-grid {{ grid-template-columns: repeat(2, 1fr); gap: 10px; }}
       .nomi-card {{ height: auto; aspect-ratio: 1 / 1; }}
+      .card-info {{ padding: 10px 12px; }}
+      .card-name {{ font-size: 1.05rem; }}
+      .card-date {{ font-size: 0.68rem; }}
+      .card-badge {{ font-size: 0.6rem; padding: 3px 8px; top: 8px; right: 8px; }}
     }}
   </style>
 </head>
@@ -2581,13 +2614,19 @@ def _run(args) -> None:
             selfies_dir.mkdir(parents=True, exist_ok=True)
 
             # --- profile picture (currently selected on the Nomi's own record) ---
-            picture_image_id = beta_nomi_info.get(uuid, {}).get("pictureImageId")
+            _nomi_info = beta_nomi_info.get(uuid, {})
+            picture_image_id = (_nomi_info.get("pictureSelfieImageId")
+                                or _nomi_info.get("pictureImageId"))
             if picture_image_id:
-                print("  Downloading profile picture ...", end=" ", flush=True)
-                profile_pic_filename = download_profile_picture(
-                    picture_image_id, selfies_dir, args.token, safe_name, cached_num_id
+                print(f"  Profile picture (id={picture_image_id[:16]}) ...", end=" ", flush=True)
+                profile_pic_filename, was_new = download_profile_picture(
+                    picture_image_id, selfies_dir, args.token, safe_name, cached_num_id,
+                    all_selfies=all_selfies
                 )
-                print("done" if profile_pic_filename else "failed")
+                if profile_pic_filename:
+                    print("downloaded" if was_new else "already up to date")
+                else:
+                    print("failed")
 
             # Download new media and ensure all have local filenames stored
             newly_dl = 0
@@ -2795,7 +2834,7 @@ def _run(args) -> None:
 
     # --- render landing page + PWA support files -----------------------
     if landing_entries:
-        landing_entries.sort(key=lambda e: e["first_msg_ts"])
+        landing_entries.sort(key=lambda e: (bool(e.get("deleted")), e["first_msg_ts"]))
         landing_html = render_landing_html(landing_entries)
         landing_path = OUTPUT_DIR / "index.html"
         landing_path.write_text(landing_html, encoding="utf-8")
