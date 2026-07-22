@@ -1,6 +1,6 @@
 # NomiVault
 
-A Python script that exports your [Nomi.ai](https://nomi.ai) conversation history to self-contained HTML files — one chat transcript per Nomi, plus an optional mind map page and media gallery. No external dependencies beyond the Python standard library (one optional package for richer mind map rendering).
+A Python script that exports your [Nomi.ai](https://nomi.ai) conversation history to self-contained HTML files — one chat transcript per Nomi (and per group chat), plus an optional mind map page and media gallery. No external dependencies beyond the Python standard library (one optional package for richer mind map rendering).
 
 ---
 
@@ -44,6 +44,7 @@ Find this script useful?  Consider making a donation through PayPal at [toddkarw
 - **Landing page** — `index.html` shows all archived Nomis as cards, sorted by first chat date, using each Nomi's actual currently-selected profile picture as the card background
 - **Per-character folders** — each Nomi's chat, mind map, media pages, cache, and downloaded media live together in their own folder, so nothing gets mixed up between Nomis
 - **Deleted Nomis stay reachable** — if you delete a Nomi from your account, its existing archive isn't dropped from the landing page; it stays there marked "Deleted on Nomi.ai" so you can still browse it
+- **Group chat archiving** — group chats get the same treatment as individual Nomis: a full transcript (each Nomi's avatar shown next to their messages), a media gallery, and a landing page card with a collage of the participants' profile pictures. A selfie generated in a group chat shows up in that group's own media page and in each participating Nomi's own gallery, but not inline in any individual Nomi's 1:1 chat timeline (it wasn't part of that conversation)
 - **No external server needed** — HTML files open directly in any browser
 
 ---
@@ -179,11 +180,17 @@ output/
       *.mp4                          Downloaded video files
       *_upload_*                     Downloaded user-uploaded files (images and video thumbnails)
       *_profile_*.webp               The Nomi's currently-selected profile picture
+  <GroupName>-group-<numericID>/
+    <GroupName>-chat.html            Full transcript, with each Nomi's avatar next to their messages
+    <GroupName>-mind-map.html        Present for consistency; empty until Nomi.ai adds group memory
+    <GroupName>-media.html           Media gallery of selfies generated in that group chat
+    <GroupName>.json                 Cache file used for incremental updates — do not delete
+    media/                          Selfies generated in the group chat
 ```
 
 If you're upgrading from an older version that wrote everything flat into the output directory, the next run automatically moves each Nomi's existing files into its new folder — no manual cleanup needed.
 
-If a Nomi is later deleted from your account, its folder and files stay exactly where they are; it just gets a "Deleted on Nomi.ai" badge on the landing page instead of disappearing.
+If a Nomi (or group chat) is later deleted from your account, its folder and files stay exactly where they are; it just gets a "Deleted on Nomi.ai" badge on the landing page instead of disappearing.
 
 Open any `.html` file directly in Chrome or Edge. No web server is needed.
 

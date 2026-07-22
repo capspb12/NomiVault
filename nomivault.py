@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 import argparse
 import configparser
@@ -258,6 +258,45 @@ def save_cache(nomi_dir: Path, safe_name: str, nomi: dict, messages: list,
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_group_cache(group_dir: Path, safe_name: str) -> dict:
+    """Load a group chat's cache record. Mirrors load_cache(), but stores
+    raw_selfies (the nested per-selfie-request wrapper shape from the
+    group messages endpoint) instead of the flat selfies list individual
+    Nomis use, since that's what's needed to correctly dedupe on the next
+    incremental run.
+    """
+    empty: dict = {
+        "messages": [],
+        "raw_selfies": [],
+        "mind_map_terms": [],
+        "numeric_group_id": None,
+    }
+    path = _cache_path(group_dir, safe_name)
+    if not path.exists():
+        return empty
+    try:
+        return {**empty, **json.loads(path.read_text(encoding="utf-8"))}
+    except Exception:
+        return empty
+
+
+def save_group_cache(group_dir: Path, safe_name: str, group: dict, messages: list,
+                     raw_selfies: list | None = None,
+                     mind_map_terms: list | None = None) -> None:
+    """Persist a group chat's messages, raw selfies, and mind-map terms."""
+    path = _cache_path(group_dir, safe_name)
+    payload = {
+        "uuid": group["uuid"],
+        "name": group["name"],
+        "numeric_group_id": group.get("id"),
+        "last_fetched": datetime.now(timezone.utc).isoformat(),
+        "messages": messages,
+        "raw_selfies": raw_selfies or [],
+        "mind_map_terms": mind_map_terms or [],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def msg_fingerprint(msg: dict) -> str:
     """Stable identity for a message used for deduplication.
 
@@ -477,6 +516,118 @@ def fetch_beta_nomi_info(token: str) -> dict:
     }
 
 
+def fetch_beta_group_chats(token: str) -> list:
+    """Return every group chat on the account, each with full metadata
+    (name, uuid, numeric id, participant Nomis, the group's memory
+    "note", etc.) from the beta.nomi.ai internal API. Unlike individual
+    Nomis, a group chat's numeric ID is already present in this listing —
+    no separate auto-discovery step is needed. Returns [] on any failure.
+    """
+    data = beta_api_get("/group-chats", token)
+    if not data or data == "AUTH_FAILED":
+        return []
+    groups = data.get("groupChats", data) if isinstance(data, dict) else data
+    return groups if isinstance(groups, list) else []
+
+
+def fetch_beta_group_messages(group_id, token: str,
+                              known_ids: set | None = None) -> tuple[list, list]:
+    """Fetch new group-chat messages by paginating backwards through history.
+
+    Mirrors ``fetch_beta_messages`` (same ``?max=<id>`` backwards-cursor
+    pagination), but for /group-chats/{id}/messages instead of a single
+    Nomi's /chat/messages. Each response also embeds any selfies
+    generated in that batch of messages (nested per selfie-request, with
+    a list of participant Nomi IDs rather than a single owner) — these
+    are collected and deduplicated by their outer id across pages.
+
+    Returns ``(new_messages, raw_selfies)`` — raw_selfies is still in the
+    nested wrapper shape; see ``_flatten_group_selfies``.
+    """
+    seen_ids:        set  = set(known_ids) if known_ids else set()
+    incremental           = bool(known_ids)
+    all_messages:    list = []
+    selfies_by_id:   dict = {}
+    extra:           dict = {}
+    page                   = 0
+    prev_oldest_uuid       = None
+
+    while True:
+        page += 1
+        data = beta_api_get(f"/group-chats/{group_id}/messages", token, extra=extra)
+
+        if data == "AUTH_FAILED":
+            print("  ⚠  beta.nomi.ai auth failed — check your --token value.")
+            break
+        if not data:
+            break
+
+        batch = data.get("messages", [])
+        for s in data.get("selfies", []):
+            if s.get("id"):
+                selfies_by_id[s["id"]] = s
+
+        if not batch:
+            print(f"    ↳ empty page — reached beginning of history")
+            break
+
+        new_msgs = []
+        for m in batch:
+            mid = m.get("uuid") or m.get("id")
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                new_msgs.append(m)
+
+        if not new_msgs:
+            if incremental:
+                print(f"    ↳ reached cached history — stopping early")
+            else:
+                print(f"    ↳ no new messages on page {page} — stopping")
+            break
+
+        all_messages.extend(new_msgs)
+        print(f"    page {page}: {len(new_msgs)} new  ({len(all_messages)} total so far)",
+              flush=True)
+
+        oldest    = min(batch, key=lambda m: m.get("sent", ""))
+        oldest_id = oldest.get("id") or oldest.get("uuid")
+
+        if not oldest_id or oldest_id == prev_oldest_uuid:
+            print(f"    ↳ cursor did not advance — stopping")
+            break
+
+        prev_oldest_uuid = oldest_id
+        extra = {"max": oldest_id}
+        time.sleep(0.2)
+
+    return all_messages, list(selfies_by_id.values())
+
+
+def _flatten_group_selfies(raw_selfies: list, group_id) -> list[dict]:
+    """Expand the nested group-selfie wrapper shape into flat per-image
+    dicts matching the shape individual selfies already use elsewhere
+    (mediaType, id, selfieRequestId, completed, type, local_filename),
+    so the existing gallery renderer and download_selfie_image() can be
+    reused as-is for group chats too.
+    """
+    flat: list[dict] = []
+    for wrapper in raw_selfies:
+        req_id    = wrapper.get("id")
+        completed = wrapper.get("completed", "")
+        for img in wrapper.get("selfies", []):
+            flat.append({
+                "mediaType":       "Selfie",
+                "type":            "Photo",
+                "id":              img.get("id"),
+                "selfieRequestId": req_id,
+                "completed":       completed,
+                "hidden":          img.get("hidden", False),
+                "groupChatId":     group_id,
+                "nomiIds":         wrapper.get("nomiIds", []),
+            })
+    return flat
+
+
 def fetch_beta_messages(nomi_id, token: str,
                         known_ids: set | None = None) -> tuple[list, list, int | None]:
     """Fetch new chat messages by paginating backwards through history.
@@ -607,13 +758,19 @@ def match_voice_call(sentinel_sent: str, voice_calls: list) -> dict | None:
 # Mind-map fetching
 # ---------------------------------------------------------------------------
 
-def fetch_mind_map_category(nomi_id, category: str, token: str) -> list:
-    """Fetch every page of memory-terms for one category."""
+def fetch_mind_map_category(entity_id, category: str, token: str,
+                            entity_type: str = "nomis") -> list:
+    """Fetch every page of memory-terms for one category.
+
+    *entity_type* is "nomis" for an individual Nomi or "group-chats" for a
+    group chat's shared memory (undocumented; may not exist/return data for
+    every group — treated the same as any other empty response).
+    """
     terms: list = []
     page = 1
     while True:
         data = beta_api_get(
-            f"/mind-maps/nomis/{nomi_id}/memory-terms", token,
+            f"/mind-maps/{entity_type}/{entity_id}/memory-terms", token,
             extra={
                 "page": page,
                 "category": category,
@@ -633,16 +790,17 @@ def fetch_mind_map_category(nomi_id, category: str, token: str) -> list:
     return terms
 
 
-def fetch_mind_map_term_detail(nomi_id, term_uuid: str, token: str) -> dict | None:
+def fetch_mind_map_term_detail(entity_id, term_uuid: str, token: str,
+                               entity_type: str = "nomis") -> dict | None:
     """Fetch the full detail (including dossier HTML) for a single memory term."""
-    data = beta_api_get(f"/mind-maps/nomis/{nomi_id}/memory-terms/{term_uuid}", token)
+    data = beta_api_get(f"/mind-maps/{entity_type}/{entity_id}/memory-terms/{term_uuid}", token)
     if not data or data == "AUTH_FAILED":
         return None
     return data
 
 
-def fetch_full_mind_map(nomi_id, token: str,
-                        cached_terms: dict) -> dict[str, list]:
+def fetch_full_mind_map(entity_id, token: str,
+                        cached_terms: dict, entity_type: str = "nomis") -> dict[str, list]:
     """Fetch all three categories, pulling fresh dossiers only for new/updated terms.
 
     *cached_terms* maps term UUID → previously saved full-term dict.
@@ -651,7 +809,7 @@ def fetch_full_mind_map(nomi_id, token: str,
     result: dict[str, list] = {}
     for category, label in MIND_MAP_CATEGORIES.items():
         print(f"  Mind map – {label}: ", end="", flush=True)
-        terms = fetch_mind_map_category(nomi_id, category, token)
+        terms = fetch_mind_map_category(entity_id, category, token, entity_type=entity_type)
         full_terms: list = []
         fetched = 0
         for term in terms:
@@ -661,7 +819,7 @@ def fetch_full_mind_map(nomi_id, token: str,
             if (not cached
                     or "dossier" not in cached
                     or cached.get("aiEdited") != term.get("aiEdited")):
-                detail = fetch_mind_map_term_detail(nomi_id, uid, token)
+                detail = fetch_mind_map_term_detail(entity_id, uid, token, entity_type=entity_type)
                 full_terms.append(detail if detail else term)
                 fetched += 1
                 time.sleep(0.1)
@@ -1718,6 +1876,11 @@ def render_landing_html(entries: list[dict]) -> str:
     on the Nomi.ai account but still has local archive files — its card is
     shown desaturated with a "Deleted on Nomi.ai" badge, still linking to
     its existing HTML.
+    A group-chat entry sets ``is_group: True`` and ``participants: [{name,
+    img_src}, ...]`` instead of a single ``char_image_src`` — its card
+    background is a side-by-side split of each participant's own profile
+    picture (each anchored top-center, like the individual cards) rather
+    than one image, and it gets a "Group Chat" badge.
     Entries must already be sorted before calling this function.
     """
     export_date = datetime.now().strftime("%b %d, %Y %I:%M %p")
@@ -1730,12 +1893,24 @@ def render_landing_html(entries: list[dict]) -> str:
         img_src  = e.get("char_image_src") or ""
         first_ts = e.get("first_msg_ts", "")
         deleted  = e.get("deleted", False)
+        is_group = e.get("is_group", False)
+        participants = e.get("participants") or []
 
-        if img_src:
-            bg_style = (f"background-image:url('{img_src}');"
-                        f"background-size:cover;background-position:center top;")
+        if is_group and participants:
+            panel_divs: list[str] = []
+            for p in participants:
+                if p.get("img_src"):
+                    panel_style = (f"background-image:url('{p['img_src']}');"
+                                   f"background-size:cover;background-position:center top;")
+                else:
+                    panel_style = "background:linear-gradient(135deg,#16213e 0%,#0f3460 100%);"
+                panel_divs.append(f'<div class="card-bg-panel" style="{panel_style}"></div>')
+            bg_html = f'<div class="card-bg card-bg-split">{"".join(panel_divs)}</div>'
+        elif img_src:
+            bg_html = (f'<div class="card-bg" style="background-image:url(\'{img_src}\');'
+                       f'background-size:cover;background-position:center top;"></div>')
         else:
-            bg_style = "background:linear-gradient(135deg,#16213e 0%,#0f3460 100%);"
+            bg_html = '<div class="card-bg" style="background:linear-gradient(135deg,#16213e 0%,#0f3460 100%);"></div>'
 
         # "Since …" date label — JS will localise; Python fallback is date-only UTC
         if first_ts:
@@ -1751,11 +1926,16 @@ def render_landing_html(entries: list[dict]) -> str:
             since = ""
 
         card_class = "nomi-card is-deleted" if deleted else "nomi-card"
-        badge      = '<div class="card-badge">Deleted on Nomi.ai</div>' if deleted else ""
+        if deleted:
+            badge = '<div class="card-badge">Deleted on Nomi.ai</div>'
+        elif is_group:
+            badge = '<div class="card-badge card-badge-group">Group Chat</div>'
+        else:
+            badge = ""
 
         cards.append(
             f'<a href="{href}" class="{card_class}">'
-            f'  <div class="card-bg" style="{bg_style}"></div>'
+            f'  {bg_html}'
             f'  <div class="card-overlay"></div>'
             f'  {badge}'
             f'  <div class="card-info">'
@@ -1818,6 +1998,8 @@ def render_landing_html(entries: list[dict]) -> str:
       transition: transform 0.35s ease;
     }}
     .nomi-card:hover .card-bg {{ transform: scale(1.06); }}
+    .card-bg-split {{ display: flex; }}
+    .card-bg-panel {{ flex: 1 1 0; height: 100%; }}
     .card-overlay {{
       position: absolute; inset: 0;
       background: linear-gradient(to bottom,
@@ -1845,6 +2027,7 @@ def render_landing_html(entries: list[dict]) -> str:
       padding: 4px 10px; border-radius: 20px;
       text-shadow: none;
     }}
+    .card-badge-group {{ background: rgba(74,158,255,0.9); }}
     .no-nomis {{ color: #445; font-style: italic; text-align: center; padding: 60px 0; }}
     footer {{ text-align: center; padding: 32px 16px; color: #555; font-size: 0.78rem; }}
     @media (max-width: 640px) {{
@@ -1941,7 +2124,11 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
                 selfies_link: str | None = None,
                 selfies: list | None = None,
                 safe_name: str = "",
-                user_uploads: list | None = None) -> str:
+                user_uploads: list | None = None,
+                is_group: bool = False,
+                speaker_avatars: dict | None = None,
+                description: str | None = None,
+                own_avatar_src: str | None = None) -> str:
     nomi_name = nomi["name"]
     relationship = nomi.get("relationshipType", "")
     created_raw = (nomi.get("created") or "")
@@ -1967,7 +2154,14 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
     for msg in messages:
         timeline.append(("msg", _msg_timestamp(msg), msg))
     for s in (selfies or []):
-        if s.get("mediaType") == "Selfie" and s.get("type") != "Art":
+        # Group-chat-generated selfies stay in this Nomi's media gallery
+        # (they legitimately involve this Nomi), but don't belong inline
+        # in this 1:1 conversation's timeline — they were generated in a
+        # different conversation entirely. That exclusion doesn't apply
+        # when rendering the group's own page, though — there, its own
+        # selfies belong in its own timeline.
+        if (s.get("mediaType") == "Selfie" and s.get("type") != "Art"
+                and (is_group or not s.get("groupChatId"))):
             timeline.append(("selfie", s.get("completed", ""), s))
     timeline.sort(key=lambda x: x[1])
 
@@ -2011,14 +2205,24 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
                 break
 
         # Determine sender
-        sender_raw = ""
-        for key in ("role", "sender", "from", "type", "senderType"):
-            if msg.get(key) is not None:
-                sender_raw = str(msg[key]).lower()
-                break
+        avatar_src = None
+        if is_group:
+            speaker_id   = msg.get("nomiId")
+            is_user      = not speaker_id
+            sender_label = msg.get("nomiName") or nomi_name if speaker_id else "You"
+            if speaker_id and speaker_avatars:
+                avatar_src = speaker_avatars.get(speaker_id)
+        else:
+            sender_raw = ""
+            for key in ("role", "sender", "from", "type", "senderType"):
+                if msg.get(key) is not None:
+                    sender_raw = str(msg[key]).lower()
+                    break
+            is_user = sender_raw in ("user", "human", "me", "0") or sender_raw.startswith("user")
+            sender_label = "You" if is_user else nomi_name
+            if not is_user:
+                avatar_src = own_avatar_src
 
-        is_user = sender_raw in ("user", "human", "me", "0") or sender_raw.startswith("user")
-        sender_label = "You" if is_user else nomi_name
         bubble_cls = "user-bubble" if is_user else "nomi-bubble"
         side_cls = "user-side" if is_user else "nomi-side"
 
@@ -2047,9 +2251,14 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
                     f'</div>'
                 )
 
+        avatar_html = (
+            f'<img class="speaker-avatar" src="{avatar_src}" alt="{_html_escape(sender_label)}">'
+            if avatar_src else ''
+        )
         bubbles.append(
             f'        <div class="message-row {side_cls}">\n'
-            f'          <div class="bubble {bubble_cls}">\n'
+            + (f'          {avatar_html}\n' if avatar_html else '')
+            + f'          <div class="bubble {bubble_cls}">\n'
             f'            <div class="sender-name">{sender_label}</div>\n'
             + (f'            {attach_html}\n' if attach_html else '')
             + (f'            <div class="message-text">{safe_text}</div>\n' if safe_text else '')
@@ -2099,15 +2308,21 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
     .header-info {{ flex: 1; min-width: 0; }}
     header h1 {{ font-size: 1.3rem; color: #e94560; font-weight: 600; }}
     header p  {{ font-size: 0.8rem; color: #888; margin-top: 3px; }}
+    .group-desc {{ font-size: 0.78rem; color: #99a3c2; margin-top: 6px; line-height: 1.4; }}
 {_NAV_CSS}
     .chat-container {{
       max-width: 760px;
       margin: 0 auto;
       padding: 24px 16px 80px;
     }}
-    .message-row {{ display: flex; margin-bottom: 14px; }}
+    .message-row {{ display: flex; align-items: flex-end; gap: 8px; margin-bottom: 14px; }}
     .nomi-side   {{ justify-content: flex-start; }}
     .user-side   {{ justify-content: flex-end;   }}
+    .speaker-avatar {{
+      width: 64px; height: 64px; border-radius: 50%;
+      object-fit: cover; object-position: center top;
+      flex-shrink: 0; border: 1px solid #0f3460;
+    }}
     .bubble {{
       max-width: 70%;
       padding: 10px 14px;
@@ -2246,6 +2461,7 @@ def render_html(nomi: dict, messages: list, new_count: int = 0,
     <div class="header-info">
       <h1>{nomi_name} &mdash; Chat</h1>
       <p>{meta_line}</p>
+      {f'<p class="group-desc">{_html_escape(description)}</p>' if description else ''}
     </div>
     {nav}
   </header>
@@ -2717,12 +2933,18 @@ def _run(args) -> None:
             )
         first_msg_ts = min((_msg_timestamp(m) for m in merged), default="") if merged else ""
         landing_entries.append({
+            "uuid":           uuid,
             "name":           name,
             "safe_name":      safe_name,
             "folder_name":    folder_name,
             "first_msg_ts":   first_msg_ts,
             "char_image_src": char_img_src,
         })
+
+        # Chat page lives inside nomi_dir itself, so its own avatar path
+        # drops the "<folder_name>/" prefix char_img_src needs from the
+        # landing page (which lives one level up).
+        own_avatar_src = char_img_src[len(folder_name) + 1:] if char_img_src else None
 
         # --- persist cache ----------------------------------------------
         save_cache(nomi_dir, safe_name, nomi, merged,
@@ -2744,10 +2966,154 @@ def _run(args) -> None:
             selfies        = all_selfies,
             safe_name      = safe_name,
             user_uploads   = all_user_uploads,
+            own_avatar_src = own_avatar_src,
         )
         out_path = nomi_dir / f"{safe_name}-chat.html"
         out_path.write_text(html, encoding="utf-8")
         print(f"  Saved → {out_path}\n")
+
+    # --- group chats (token path only — no public-API equivalent) -------
+    # Looked up by participant UUID so a group's landing card and chat
+    # bubbles can reuse each participant's own already-resolved profile
+    # picture from this run.
+    individual_by_uuid = {e["uuid"]: e for e in landing_entries if e.get("uuid")}
+    group_uuids: set = set()
+
+    if args.token:
+        print("Fetching group chats...")
+        groups = fetch_beta_group_chats(args.token)
+        if groups:
+            print(f"Found {len(groups)} group chat(s): "
+                  f"{', '.join(g['name'] for g in groups)}\n")
+
+        for group in groups:
+            group_name      = group["name"]
+            group_uuid      = group["uuid"]
+            group_id        = group["id"]
+            safe_group_name = _safe_name(group_name)
+            folder_name     = f"{safe_group_name}-group-{group_id}"
+            group_dir       = OUTPUT_DIR / folder_name
+            group_dir.mkdir(parents=True, exist_ok=True)
+            group_uuids.add(group_uuid)
+
+            print(f"Processing group: {group_name}  ({group_uuid})")
+
+            cache             = {} if args.full else load_group_cache(group_dir, safe_group_name)
+            cached_messages   = cache.get("messages", [])
+            cached_raw_selfies = cache.get("raw_selfies", [])
+            cached_mm_terms   = cache.get("mind_map_terms", [])
+            is_incremental    = bool(cached_messages)
+
+            known_ids: set = {
+                m.get("uuid") or m.get("id")
+                for m in cached_messages
+                if m.get("uuid") or m.get("id")
+            } if is_incremental else set()
+
+            print(f"  Fetching from beta.nomi.ai (group_id={group_id}) ...")
+            fresh_msgs, fresh_raw_selfies = fetch_beta_group_messages(
+                group_id, args.token, known_ids=known_ids or None
+            )
+
+            if is_incremental:
+                merged, new_count = merge_messages(cached_messages, fresh_msgs)
+                print(f"  {'+'+ str(new_count) + ' new message(s)' if new_count else 'No new messages'}"
+                      f"  ({len(merged)} total)")
+            else:
+                merged    = fresh_msgs
+                new_count = len(merged)
+                print(f"  {new_count} messages downloaded")
+
+            # Merge raw selfies (dedup by the outer selfie-request id)
+            raw_selfies_by_id = {s["id"]: s for s in cached_raw_selfies if s.get("id")}
+            for s in fresh_raw_selfies:
+                if s.get("id"):
+                    raw_selfies_by_id[s["id"]] = s
+            all_raw_selfies = list(raw_selfies_by_id.values())
+            flat_selfies    = _flatten_group_selfies(all_raw_selfies, group_id)
+
+            group_media_dir = group_dir / "media"
+            group_media_dir.mkdir(parents=True, exist_ok=True)
+            resolved = 0
+            for s in flat_selfies:
+                fn = download_selfie_image(s, group_media_dir, args.token, safe_group_name)
+                if fn:
+                    s["local_filename"] = fn
+                    resolved += 1
+            if flat_selfies:
+                print(f"  {resolved}/{len(flat_selfies)} group selfie(s) available")
+
+            # Group mind maps are undocumented and may not exist as a real
+            # endpoint for every account/group — degrade to empty rather
+            # than letting an unexpected error status take down the run.
+            cached_mm_lookup = {t["uuid"]: t for t in cached_mm_terms}
+            try:
+                mm_by_category = fetch_full_mind_map(
+                    group_id, args.token, cached_mm_lookup, entity_type="group-chats"
+                )
+            except Exception as exc:
+                print(f"  ⚠  Group mind map unavailable: {exc}")
+                mm_by_category = {}
+            all_mm_terms = [t for terms in mm_by_category.values() for t in terms]
+
+            # Participant avatars: each participant's own already-resolved
+            # profile picture from this run, used for chat bubbles (path
+            # relative to the group's own folder) and the landing collage
+            # (path relative to OUTPUT_DIR, matching individual entries).
+            speaker_avatars: dict = {}
+            participants_for_card: list = []
+            for p in group.get("nomis", []):
+                p_id      = p.get("id")
+                p_name    = p.get("name")
+                p_entry   = individual_by_uuid.get(p.get("uuid"))
+                p_img_src = p_entry.get("char_image_src") if p_entry else None
+                if p_img_src:
+                    speaker_avatars[p_id] = f"../{p_img_src}"
+                participants_for_card.append({"name": p_name, "img_src": p_img_src})
+
+            chat_lnk  = f"{safe_group_name}-chat.html"
+            mm_lnk    = f"{safe_group_name}-mind-map.html"
+            media_lnk = f"{safe_group_name}-media.html"
+
+            mm_html = render_mind_map_html(group, mm_by_category,
+                                           chat_link=chat_lnk, selfies_link=media_lnk)
+            (group_dir / f"{safe_group_name}-mind-map.html").write_text(mm_html, encoding="utf-8")
+
+            gallery_html = render_gallery_html(group, flat_selfies, safe_group_name,
+                                               chat_link=chat_lnk, mind_map_link=mm_lnk)
+            (group_dir / f"{safe_group_name}-media.html").write_text(gallery_html, encoding="utf-8")
+
+            description = (group.get("note") or {}).get("text") or None
+            html = render_html(
+                group, merged,
+                new_count      = new_count if is_incremental else 0,
+                mind_map_link  = mm_lnk,
+                selfies_link   = media_lnk,
+                selfies        = flat_selfies,
+                safe_name      = safe_group_name,
+                is_group       = True,
+                speaker_avatars = speaker_avatars,
+                description    = description,
+            )
+            (group_dir / chat_lnk).write_text(html, encoding="utf-8")
+            print(f"  Saved → {group_dir / chat_lnk}\n")
+
+            save_group_cache(group_dir, safe_group_name, group, merged,
+                             raw_selfies=all_raw_selfies,
+                             mind_map_terms=all_mm_terms)
+
+            first_msg_ts = (min((_msg_timestamp(m) for m in merged), default="")
+                           if merged else group.get("created", ""))
+            landing_entries.append({
+                "uuid":           group_uuid,
+                "name":           group_name,
+                "safe_name":      safe_group_name,
+                "folder_name":    folder_name,
+                "first_msg_ts":   first_msg_ts,
+                "char_image_src": None,
+                "is_group":       True,
+                "participants":   participants_for_card,
+            })
 
     # --- keep archives of deleted Nomis reachable on the landing page ---
     # If a Nomi no longer appears in the account (deleted on Nomi.ai), its
@@ -2755,7 +3121,7 @@ def _run(args) -> None:
     # it, so it would otherwise vanish from index.html even though nothing
     # was actually removed from disk. Scan for any cache file whose UUID
     # isn't in this run's active list and re-add it, marked as deleted.
-    active_uuids = {n["uuid"] for n in nomis}
+    active_uuids = {n["uuid"] for n in nomis} | group_uuids
 
     # Migrate any leftover pre-1.5 flat-root files for a Nomi that's no
     # longer in the account at all — the main loop's own migration only
