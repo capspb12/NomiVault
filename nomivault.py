@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 import argparse
 import configparser
@@ -834,6 +834,19 @@ def fetch_full_mind_map(entity_id, token: str,
 # Selfie fetching and downloading
 # ---------------------------------------------------------------------------
 
+def _media_item_key(item: dict) -> str | None:
+    """Return whichever identifier a media item is actually keyed by.
+
+    Most media types (Selfie, CharacterImage) use "id". VideoRequest and
+    ImageEditRequest use "uuid" instead and have no "id" field at all —
+    the download functions for those two already know this (see
+    download_video_media / download_image_edit), but the generic
+    dedup/caching logic needs the same fallback so those items don't get
+    silently dropped for lacking an "id".
+    """
+    return item.get("id") or item.get("uuid")
+
+
 def fetch_selfies(nomi_id, token: str) -> list:
     """Return metadata for every non-hidden, completed media item (all pages).
 
@@ -851,20 +864,48 @@ def fetch_selfies(nomi_id, token: str) -> list:
         )
         if not data or data == "AUTH_FAILED":
             break
-        batch = [
-            m for m in data.get("medias", [])
-            if not m.get("hidden")
+        batch = []
+        for m in data.get("medias", []):
+            if m.get("hidden"):
+                continue
             # CharacterImage has no "completed" field — always include it.
             # For every other type, require "completed" so in-progress
             # generations are not included.
-            and (m.get("completed") or m.get("mediaType") == "CharacterImage")
-        ]
+            if not (m.get("completed") or m.get("mediaType") == "CharacterImage"):
+                continue
+            if not _media_item_key(m):
+                # Every media item is keyed by "id" or "uuid" elsewhere
+                # (dedup, filenames, downloads) — skip anything missing
+                # both rather than crash, but flag it since it means the
+                # API returned a shape we haven't seen before.
+                print(f"  ℹ  Skipping media item with no \"id\" or \"uuid\" field "
+                      f"(mediaType={m.get('mediaType')!r}): {m}")
+                continue
+            batch.append(m)
         all_selfies.extend(batch)
         if page >= data.get("maxPages", 1):
             break
         page += 1
         time.sleep(0.2)
-    return all_selfies
+
+    # The API can return the same item on more than one page (pagination
+    # overlap), which would otherwise slip past the caller's dedup-against-
+    # cache check as two "new" entries pointing at the same downloaded
+    # files. Some VideoRequest/ImageEditRequest items also appear to gain
+    # an "id" field on a later fetch that they didn't have before (only
+    # "uuid" that first time) — since a single preferred key would treat
+    # that as a different item even though _video_filename/_image_edit_
+    # filename still resolve it to the same downloaded file, dedup here by
+    # ANY shared identifier rather than one fixed key.
+    seen_ids: set = set()
+    deduped: list = []
+    for item in all_selfies:
+        ids = {v for v in (item.get("id"), item.get("uuid")) if v}
+        if ids and ids & seen_ids:
+            continue
+        seen_ids |= ids
+        deduped.append(item)
+    return deduped
 
 
 def _selfie_filename(selfie: dict, safe_name: str) -> str:
@@ -2812,11 +2853,35 @@ def _run(args) -> None:
         profile_pic_filename: str | None = None
         if using_token:
             print("  Fetching media list ...", end=" ", flush=True)
-            fresh_selfies     = fetch_selfies(cached_num_id, args.token)
-            cached_selfie_ids = {s["id"] for s in all_selfies}
-            new_selfies       = [s for s in fresh_selfies if s["id"] not in cached_selfie_ids]
+            fresh_selfies = fetch_selfies(cached_num_id, args.token)
+            cached_ids: set = set()
+            for s in all_selfies:
+                cached_ids |= {v for v in (s.get("id"), s.get("uuid")) if v}
+            new_selfies = [
+                s for s in fresh_selfies
+                if not ({v for v in (s.get("id"), s.get("uuid")) if v} & cached_ids)
+            ]
             all_selfies       = all_selfies + new_selfies
             print(f"{len(fresh_selfies)} total, {len(new_selfies)} new")
+
+            # One-time cleanup: a cache saved before pagination-overlap
+            # dedup existed (or before VideoRequest/ImageEditRequest were
+            # correctly tracked by uuid) could already have duplicate
+            # entries pointing at the same downloaded files. Collapse them
+            # by shared identifier rather than one fixed key — see the
+            # matching comment in fetch_selfies() for why.
+            _seen_ids: set = set()
+            _deduped: list = []
+            for s in all_selfies:
+                ids = {v for v in (s.get("id"), s.get("uuid")) if v}
+                if ids and ids & _seen_ids:
+                    continue
+                _seen_ids |= ids
+                _deduped.append(s)
+            if len(_deduped) < len(all_selfies):
+                print(f"  Removed {len(all_selfies) - len(_deduped)} duplicate media "
+                      f"entr{'y' if len(all_selfies) - len(_deduped) == 1 else 'ies'} from the cache")
+            all_selfies = _deduped
 
             # Report all unique media types found in the full list (cache + new).
             _known_media_types = {"Selfie", "VideoRequest", "CharacterImage", "ImageEditRequest", "Art"}
