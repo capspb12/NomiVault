@@ -12,7 +12,7 @@ If auto-discovery fails, follow the DevTools step in the README to find the URL,
 then pass it via --messages-url.
 """
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 import argparse
 import configparser
@@ -489,7 +489,13 @@ def fetch_beta_nomi_info(token: str) -> dict:
     auto-discovered on a Nomi's very first --token run, without the user
     needing to look it up in the browser URL and pass --nomi-id manually.
 
-    The profile picture is tracked in one of three fields, checked in this
+    The API now reports the active profile picture as a single
+    "pictureMediaItemUuid" plus a "pictureMediaItemType" (e.g.
+    "SelfieImage", "CharacterImage"), and the older per-type fields below
+    no longer appear in its response. Those are still honored as a
+    fallback in case an account/endpoint still returns them.
+
+    The older scheme tracked it in one of three fields, checked in this
     order: "imageEditRequestUuid" (set when the active picture is an
     edited image — pictureImageId/pictureSelfieImageId are NOT updated in
     this case and keep pointing at whichever picture was active before
@@ -512,6 +518,8 @@ def fetch_beta_nomi_info(token: str) -> dict:
             "pictureImageId":       n.get("pictureImageId"),
             "pictureSelfieImageId": n.get("pictureSelfieImageId"),
             "imageEditRequestUuid": n.get("imageEditRequestUuid"),
+            "pictureMediaItemUuid": n.get("pictureMediaItemUuid"),
+            "pictureMediaItemType": n.get("pictureMediaItemType"),
         }
         for n in nomis
         if n.get("uuid")
@@ -1023,26 +1031,29 @@ def download_character_image(img: dict, selfies_dir: Path, token: str,
 def download_profile_picture(picture_image_id: str, selfies_dir: Path, token: str,
                               safe_name: str, nomi_id,
                               all_selfies: list | None = None,
-                              image_edit_uuid: str | None = None) -> tuple[str | None, bool]:
+                              image_edit_uuid: str | None = None,
+                              media_item_type: str | None = None) -> tuple[str | None, bool]:
     """Download the Nomi's currently-selected profile picture.
 
-    *picture_image_id* should be whichever of imageEditRequestUuid /
-    pictureSelfieImageId / pictureImageId is currently active (see
-    ``fetch_beta_nomi_info``). The filename is keyed by that ID, so a
-    change to it triggers a fresh download instead of reusing a stale
-    cached one.
+    *picture_image_id* should be whichever of pictureMediaItemUuid /
+    imageEditRequestUuid / pictureSelfieImageId / pictureImageId is
+    currently active (see ``fetch_beta_nomi_info``). The filename is keyed
+    by that ID, so a change to it triggers a fresh download instead of
+    reusing a stale cached one.
 
-    Character images are served from the generic per-Nomi image endpoint,
-    but selfies are served from a selfie-request-scoped endpoint instead
-    (see ``download_selfie_image``), and edited images (ImageEditRequest)
-    from yet another endpoint (see ``download_image_edit``) — since the ID
-    alone doesn't say which kind it is, the generic endpoint is tried
-    first. If *image_edit_uuid* is given (the caller already knows this is
-    an ImageEditRequest, from the imageEditRequestUuid field), the
-    edit-specific URL is tried directly. Otherwise, as a fallback, we look
-    the ID up in *all_selfies* (matching on either "id" or "uuid", since
-    ImageEditRequest items only carry a "uuid") for a matching
-    selfieRequestId or ImageEditRequest to try the type-specific URL.
+    The current API reports the picture as a pictureMediaItemUuid (with a
+    *media_item_type* such as "SelfieImage" or "CharacterImage"), which is
+    served from /api/media-items/{uuid}/image.webp regardless of type — so
+    when *media_item_type* is given that URL is tried first.
+
+    The remaining URLs are fallbacks for the older ID scheme: character
+    images come from the generic per-Nomi image endpoint, selfies from a
+    selfie-request-scoped endpoint (see ``download_selfie_image``), and
+    edited images from the image-edit-requests endpoint (see
+    ``download_image_edit``). Since an old-style ID alone doesn't say
+    which kind it is, *image_edit_uuid* (from imageEditRequestUuid) or a
+    lookup of the ID in *all_selfies* (matching "id" or "uuid") picks the
+    type-specific URL.
 
     Returns ``(filename, was_freshly_downloaded)`` — filename is None on
     failure.
@@ -1057,7 +1068,13 @@ def download_profile_picture(picture_image_id: str, selfies_dir: Path, token: st
         "Referer": "https://beta.nomi.ai/",
         "Accept":  "image/webp,image/*",
     }
-    urls = [f"https://beta.nomi.ai/api/nomis/{nomi_id}/images/{picture_image_id}.webp"]
+    urls = []
+    if media_item_type:
+        urls.append(
+            f"https://beta.nomi.ai/api/media-items/{picture_image_id}"
+            f"/image.webp?imageVersion=2"
+        )
+    urls.append(f"https://beta.nomi.ai/api/nomis/{nomi_id}/images/{picture_image_id}.webp")
     if image_edit_uuid:
         urls.append(
             f"https://beta.nomi.ai/api/image-edit-requests/{image_edit_uuid}"
@@ -2914,27 +2931,6 @@ def _run(args) -> None:
             selfies_dir = nomi_dir / "media"
             selfies_dir.mkdir(parents=True, exist_ok=True)
 
-            # --- profile picture (currently selected on the Nomi's own record) ---
-            _nomi_info = beta_nomi_info.get(uuid, {})
-            # imageEditRequestUuid is checked first: when an edited image is
-            # set as the profile picture, pictureImageId/pictureSelfieImageId
-            # are NOT updated and keep pointing at whichever picture was
-            # active before the edit.
-            _image_edit_uuid = _nomi_info.get("imageEditRequestUuid")
-            picture_image_id = (_image_edit_uuid
-                                or _nomi_info.get("pictureSelfieImageId")
-                                or _nomi_info.get("pictureImageId"))
-            if picture_image_id:
-                print(f"  Profile picture (id={picture_image_id[:16]}) ...", end=" ", flush=True)
-                profile_pic_filename, was_new = download_profile_picture(
-                    picture_image_id, selfies_dir, args.token, safe_name, cached_num_id,
-                    all_selfies=all_selfies, image_edit_uuid=_image_edit_uuid,
-                )
-                if profile_pic_filename:
-                    print("downloaded" if was_new else "already up to date")
-                else:
-                    print("failed")
-
             # Download new media and ensure all have local filenames stored
             newly_dl = 0
             for s in all_selfies:
@@ -2974,6 +2970,35 @@ def _run(args) -> None:
                             newly_dl += 1
             if newly_dl:
                 print(f"  Downloaded {newly_dl} new media file(s)")
+
+            # --- profile picture (currently selected on the Nomi's own record) ---
+            # Done after the media download loop so a picture that's also in
+            # the media list can reuse its already-downloaded file.
+            _nomi_info = beta_nomi_info.get(uuid, {})
+            # pictureMediaItemUuid/Type is the current scheme. The older
+            # fields are kept as a fallback; among those, imageEditRequestUuid
+            # is checked first since pictureImageId/pictureSelfieImageId were
+            # NOT updated when an edited image was set as the picture.
+            _media_item_type = _nomi_info.get("pictureMediaItemType")
+            _image_edit_uuid = _nomi_info.get("imageEditRequestUuid")
+            picture_image_id = (_nomi_info.get("pictureMediaItemUuid")
+                                or _image_edit_uuid
+                                or _nomi_info.get("pictureSelfieImageId")
+                                or _nomi_info.get("pictureImageId"))
+            if picture_image_id:
+                print(f"  Profile picture (id={picture_image_id[:16]}) ...", end=" ", flush=True)
+                profile_pic_filename, was_new = download_profile_picture(
+                    picture_image_id, selfies_dir, args.token, safe_name, cached_num_id,
+                    all_selfies=all_selfies, image_edit_uuid=_image_edit_uuid,
+                    media_item_type=_media_item_type,
+                )
+                if profile_pic_filename:
+                    print("downloaded" if was_new else "already up to date")
+                else:
+                    print("failed")
+            else:
+                print("  ℹ  No profile picture ID found on this Nomi's record; "
+                      "using its first character image instead.")
 
             # --- user uploads (attached images/videos the user sent) ----
             cached_upload_ids = {u["message_uuid"] for u in all_user_uploads}
